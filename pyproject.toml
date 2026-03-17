@@ -1,0 +1,12 @@
+[project]
+name = "comfyui-spectrum-wan-native"
+version = "0.1.0"
+description = "Native ComfyUI WAN Spectrum forecaster nodes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+
+[tool.comfy]
+PublisherId = "openai"
+DisplayName = "ComfyUI Spectrum WAN Native"
+Icon = ""
