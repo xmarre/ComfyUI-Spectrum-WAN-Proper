@@ -261,8 +261,10 @@ class SpectrumWanRuntime:
             raise ValueError(f"{key} must be an integer, got {value!r}.")
         if isinstance(value, str):
             text = value.strip()
-            if text and text.lstrip("+-").isdigit():
-                return int(text)
+            if text:
+                check = text[1:] if text[0] in "+-" else text
+                if check.isdigit():
+                    return int(text)
         raise ValueError(f"{key} must be an integer, got {value!r}.")
 
     def _schedule_signature(self, transformer_options: Dict[str, Any]):
