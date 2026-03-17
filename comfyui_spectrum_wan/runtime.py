@@ -154,6 +154,8 @@ class _StreamState:
     last_processed_global_step: Optional[int] = None
     global_step_override_raw: Optional[int] = None
     global_step_override_anchor: Optional[int] = None
+    bias_shift_global_anchor: Optional[int] = None
+    bias_shift_global_anchor_step_idx: int = 0
     global_step_override_anchor_step_idx: int = 0
 
     def __post_init__(self) -> None:
@@ -181,6 +183,8 @@ class _StreamState:
         self.last_processed_global_step = None
         self.global_step_override_raw = None
         self.global_step_override_anchor = None
+        self.bias_shift_global_anchor = None
+        self.bias_shift_global_anchor_step_idx = 0
         self.global_step_override_anchor_step_idx = 0
         assert self.forecaster is not None
         self.forecaster.reset()
@@ -247,12 +251,19 @@ class SpectrumWanRuntime:
             )
 
     def _parse_metadata_int(self, value: Any, key: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{key} must be an integer, got {value!r}.")
         if isinstance(value, int):
             return int(value)
-        try:
-            return int(value)
-        except Exception as exc:
-            raise ValueError(f"{key} must be an integer, got {value!r}.") from exc
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value)
+            raise ValueError(f"{key} must be an integer, got {value!r}.")
+        if isinstance(value, str):
+            text = value.strip()
+            if text and text.lstrip("+-").isdigit():
+                return int(text)
+        raise ValueError(f"{key} must be an integer, got {value!r}.")
 
     def _schedule_signature(self, transformer_options: Dict[str, Any]):
         sample_sigmas = transformer_options.get("sample_sigmas", None)
@@ -266,8 +277,6 @@ class SpectrumWanRuntime:
 
     def _resolve_run_token(self, transformer_options: Dict[str, Any]) -> int:
         token = transformer_options.get(_RUN_TOKEN_KEY)
-        if isinstance(token, int):
-            return token
         if token is None:
             token = int(next(_RUN_TOKEN_COUNTER))
             transformer_options[_RUN_TOKEN_KEY] = token
@@ -403,7 +412,15 @@ class SpectrumWanRuntime:
         stream.global_step_override_anchor = None
         stream.global_step_override_anchor_step_idx = 0
         if stream.bias_shift_predictor is not None:
-            return stream.bias_shift_predictor.global_step(step_idx)
+            anchored_global_step = int(stream.bias_shift_predictor.global_step(step_idx))
+            stream.bias_shift_global_anchor = anchored_global_step
+            stream.bias_shift_global_anchor_step_idx = int(step_idx)
+            return anchored_global_step
+        if stream.bias_shift_global_anchor is not None:
+            return int(
+                stream.bias_shift_global_anchor
+                + (int(step_idx) - int(stream.bias_shift_global_anchor_step_idx))
+            )
         return int(step_idx)
 
     def begin_step(self, transformer_options: Dict[str, Any], timesteps: torch.Tensor) -> Dict[str, Any]:
@@ -433,6 +450,8 @@ class SpectrumWanRuntime:
                 stream.bias_shift_attempted = True
                 handoff = self._consume_bias_shift_handoff(transformer_options)
                 if handoff is not None:
+                    stream.bias_shift_global_anchor = int(handoff.next_global_step)
+                    stream.bias_shift_global_anchor_step_idx = int(step_idx)
                     stream.bias_shift_predictor = _BiasShiftPredictor.from_handoff(self.cfg, handoff)
 
         global_step = self._global_step(transformer_options, stream, step_idx)

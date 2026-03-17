@@ -227,6 +227,37 @@ def test_global_step_override_advances_and_reanchors() -> None:
     assert low_reanchored["global_step"] == 20
     assert predictor.total_steps(low_runtime.num_steps(), low_reanchored["step_idx"], low_reanchored["global_step"]) == 21
 
+    failing_high_runtime = _make_runtime("wan22_high_noise", "bias_shift")
+    failing_low_runtime = _make_runtime("wan22_low_noise", "bias_shift")
+    failing_run_token = 402
+
+    _publish_high_handoff(failing_high_runtime, high_sigmas, failing_run_token, [2, 2])
+
+    failing_opts = {
+        "sample_sigmas": low_sigmas,
+        "cond_or_uncond": [2, 2],
+        "spectrum_wan_run_token": failing_run_token,
+        "spectrum_wan_global_step_override": 30,
+    }
+    failing_start = failing_low_runtime.begin_step(failing_opts, torch.tensor([low_sigmas[0]]))
+    assert failing_start["global_step"] == 30
+
+    failing_stream = failing_low_runtime._stream(failing_opts)
+    assert failing_stream.bias_shift_predictor is not None
+
+    failing_low_runtime.observe_feature(
+        failing_opts,
+        failing_start["step_idx"],
+        torch.full((1, 5, 8), 9.0, dtype=torch.float32),
+        global_step=failing_start["global_step"],
+    )
+
+    assert failing_stream.bias_shift_predictor is None
+
+    failing_followup = failing_low_runtime.begin_step(failing_opts, torch.tensor([low_sigmas[1]]))
+    assert failing_followup["global_step"] == 31
+    assert failing_followup["actual_forward"]
+
 
 def test_unsupported_bias_shift_backends_raise() -> None:
     _expect_value_error(
@@ -264,6 +295,32 @@ def test_malformed_metadata_raises() -> None:
                 "sample_sigmas": torch.tensor([1.0, 0.0], dtype=torch.float32),
                 "cond_or_uncond": [0],
                 "spectrum_wan_global_step_override": "bad-step",
+            },
+            torch.tensor([1.0], dtype=torch.float32),
+        ),
+        "spectrum_wan_global_step_override",
+    )
+
+    bool_metadata_runtime = _make_runtime("wan22_high_noise", "separate_fit")
+    _expect_value_error(
+        lambda: bool_metadata_runtime.begin_step(
+            {
+                "sample_sigmas": torch.tensor([1.0, 0.0], dtype=torch.float32),
+                "cond_or_uncond": [0],
+                "spectrum_wan_run_token": True,
+            },
+            torch.tensor([1.0], dtype=torch.float32),
+        ),
+        "spectrum_wan_run_token",
+    )
+
+    float_metadata_runtime = _make_runtime("wan22_high_noise", "separate_fit")
+    _expect_value_error(
+        lambda: float_metadata_runtime.begin_step(
+            {
+                "sample_sigmas": torch.tensor([1.0, 0.0], dtype=torch.float32),
+                "cond_or_uncond": [0],
+                "spectrum_wan_global_step_override": 10.5,
             },
             torch.tensor([1.0], dtype=torch.float32),
         ),
