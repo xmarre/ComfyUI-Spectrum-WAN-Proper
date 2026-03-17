@@ -32,11 +32,17 @@ class _PublishedTransitionHandoff:
 
 @dataclass
 class _BiasShiftPredictor:
-    forecaster: ChebyshevFeatureForecaster
+    degree: int
+    ridge_lambda: float
+    blend_weight: float
+    history_size: int
+    fit_chunk_size: int
     low_phase_offset: int
     total_steps_hint: int
     feature_shape: torch.Size
     feature_dtype: torch.dtype
+    handoff_history: List[Tuple[int, torch.Tensor]] = field(default_factory=list)
+    forecaster: Optional[ChebyshevFeatureForecaster] = None
     bias_delta: Optional[torch.Tensor] = None
 
     @classmethod
@@ -45,24 +51,35 @@ class _BiasShiftPredictor:
         cfg: SpectrumWanConfig,
         handoff: _PublishedTransitionHandoff,
     ) -> Optional["_BiasShiftPredictor"]:
-        forecaster = ChebyshevFeatureForecaster(
+        if len(handoff.history) < 2:
+            return None
+        return cls(
             degree=cfg.degree,
             ridge_lambda=cfg.ridge_lambda,
             blend_weight=cfg.blend_weight,
             history_size=cfg.history_size,
             fit_chunk_size=cfg.fit_chunk_size,
-        )
-        for global_step, feature in handoff.history:
-            forecaster.update(global_step, feature)
-        if not forecaster.ready():
-            return None
-        return cls(
-            forecaster=forecaster,
             low_phase_offset=handoff.next_global_step,
             total_steps_hint=int(handoff.total_steps_hint),
             feature_shape=handoff.feature_shape,
             feature_dtype=handoff.feature_dtype,
+            handoff_history=list(handoff.history),
         )
+
+    def _ensure_forecaster(self, target_device: torch.device) -> None:
+        if self.forecaster is not None:
+            return
+        forecaster = ChebyshevFeatureForecaster(
+            degree=self.degree,
+            ridge_lambda=self.ridge_lambda,
+            blend_weight=self.blend_weight,
+            history_size=self.history_size,
+            fit_chunk_size=self.fit_chunk_size,
+        )
+        for global_step, feature in self.handoff_history:
+            forecaster.update(global_step, feature.to(device=target_device, non_blocking=True))
+        self.handoff_history.clear()
+        self.forecaster = forecaster
 
     def ready(self) -> bool:
         return self.bias_delta is not None
@@ -84,6 +101,8 @@ class _BiasShiftPredictor:
         if actual.dtype != self.feature_dtype and (not actual.dtype.is_floating_point or not self.feature_dtype.is_floating_point):
             return False
 
+        self._ensure_forecaster(actual.device)
+        assert self.forecaster is not None
         global_step = self.global_step(low_step_idx, explicit_global_step)
         predicted = self.forecaster.predict(
             global_step,
@@ -91,6 +110,7 @@ class _BiasShiftPredictor:
         )
         predicted = predicted.to(device=actual.device, dtype=actual.dtype)
         if predicted.shape != actual.shape or not torch.isfinite(predicted).all():
+            self.forecaster = None
             return False
 
         self.feature_shape = actual.shape
@@ -101,6 +121,7 @@ class _BiasShiftPredictor:
     def predict(self, low_step_idx: int, explicit_global_step: Optional[int], local_total_steps: int) -> torch.Tensor:
         if self.bias_delta is None:
             raise RuntimeError("Bias-shift predictor is not initialized.")
+        assert self.forecaster is not None
         global_step = self.global_step(low_step_idx, explicit_global_step)
         predicted = self.forecaster.predict(
             global_step,
