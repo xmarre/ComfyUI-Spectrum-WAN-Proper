@@ -217,6 +217,15 @@ ComfyUI-Spectrum-WAN-Proper/
     └── smoke_runtime.py
 ```
 
+## Transition modes
+
+`Spectrum Apply WAN` supports two expert-transition modes:
+
+- `separate_fit` keeps the default per-expert reset / re-fit behavior.
+- `bias_shift` is an experimental Wan 2.2 high-noise to low-noise handoff that forces the first low-noise step actual, computes a 1-step bias correction, refreshes that bias on later actual low-noise refresh steps, and uses the transferred high-noise predictor on forecast-eligible low-noise steps.
+
+For Wan 2.2 expert workflows, set `transition_mode = bias_shift` on both expert nodes if you want the experimental handoff. The high-noise expert publishes the transfer state and the low-noise expert consumes it. If the handoff is missing or incompatible, the low-noise expert falls back to the normal per-expert fit path. `spectrum_wan_run_token` must stay consistent across both phases, and `spectrum_wan_global_step_override` is only needed if the low phase is not contiguous from the published high-phase boundary.
+
 ## Smoke test
 
 A lightweight non-ComfyUI test is included:

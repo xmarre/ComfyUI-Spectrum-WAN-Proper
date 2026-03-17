@@ -109,7 +109,11 @@ def _wrap_wan_forward_orig(inner: Any) -> None:
 
         if not actual_forward and runtime.can_forecast(transformer_options):
             try:
-                predicted_x = runtime.predict_feature(transformer_options, step_idx)
+                predicted_x = runtime.predict_feature(
+                    transformer_options,
+                    step_idx,
+                    global_step=decision.get("global_step"),
+                )
             except Exception:
                 predicted_x = None
 
@@ -158,7 +162,12 @@ def _wrap_wan_forward_orig(inner: Any) -> None:
                     transformer_options=transformer_options,
                 )
 
-        runtime.observe_feature(transformer_options, step_idx, x)
+        runtime.observe_feature(
+            transformer_options,
+            step_idx,
+            x,
+            global_step=decision.get("global_step"),
+        )
 
         x = inner.head(x, temb)
         if full_ref is not None:
