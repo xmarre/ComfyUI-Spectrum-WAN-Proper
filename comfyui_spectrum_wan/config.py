@@ -11,10 +11,16 @@ _VALID_BACKENDS = {
     "wan22_low_noise",
 }
 
+_VALID_TRANSITION_MODES = {
+    "separate_fit",
+    "bias_shift",
+}
+
 
 @dataclass
 class SpectrumWanConfig:
     backend: str = "auto"
+    transition_mode: str = "separate_fit"
     enabled: bool = True
     blend_weight: float = 1.0
     degree: int = 4
@@ -29,6 +35,8 @@ class SpectrumWanConfig:
     def validated(self) -> "SpectrumWanConfig":
         if self.backend not in _VALID_BACKENDS:
             raise ValueError(f"Unsupported backend '{self.backend}'.")
+        if self.transition_mode not in _VALID_TRANSITION_MODES:
+            raise ValueError(f"Unsupported transition_mode '{self.transition_mode}'.")
         if not (0.0 <= float(self.blend_weight) <= 1.0):
             raise ValueError("blend_weight must be in [0, 1].")
         if int(self.degree) < 1:

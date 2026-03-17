@@ -20,6 +20,13 @@ class SpectrumApplyWAN:
                     ],
                     {"default": "auto"},
                 ),
+                "transition_mode": (
+                    [
+                        "separate_fit",
+                        "bias_shift",
+                    ],
+                    {"default": "separate_fit"},
+                ),
                 "enabled": ("BOOLEAN", {"default": True}),
                 "blend_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "degree": ("INT", {"default": 4, "min": 1, "max": 16, "step": 1}),
@@ -41,6 +48,7 @@ class SpectrumApplyWAN:
         self,
         model,
         backend,
+        transition_mode,
         enabled,
         blend_weight,
         degree,
@@ -56,6 +64,7 @@ class SpectrumApplyWAN:
 
         cfg = SpectrumWanConfig(
             backend=backend,
+            transition_mode=transition_mode,
             enabled=enabled,
             blend_weight=blend_weight,
             degree=degree,
