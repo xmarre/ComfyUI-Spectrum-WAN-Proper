@@ -22,6 +22,19 @@ class DummyLowModel:
     model_name = "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors"
 
 
+class DummyTi2vModel:
+    model_name = "wan2.2_ti2v_5b_fp16.safetensors"
+
+
+def _expect_value_error(fn, expected_fragment: str) -> None:
+    try:
+        fn()
+    except ValueError as exc:
+        assert expected_fragment in str(exc), str(exc)
+        return
+    raise AssertionError("Expected ValueError")
+
+
 def _cfg(backend: str, transition_mode: str) -> SpectrumWanConfig:
     return SpectrumWanConfig(
         backend=backend,
@@ -58,6 +71,7 @@ def _publish_high_handoff(runtime: SpectrumWanRuntime, sigmas: torch.Tensor, run
             feature,
             global_step=decision["global_step"],
         )
+        assert runtime._stream(opts).actual_history[-1][1].device.type == "cpu"
 
 
 def _test_split_schedule_bias_shift() -> None:
@@ -87,6 +101,7 @@ def _test_split_schedule_bias_shift() -> None:
         low_first_feature,
         global_step=low_start["global_step"],
     )
+    assert not low_runtime._stream(low_opts).actual_history
     assert low_runtime.can_forecast(low_opts)
 
     low_followup = low_runtime.begin_step(low_opts, torch.tensor([low_sigmas[1]]))
@@ -131,9 +146,131 @@ def _test_run_token_mismatch_falls_back() -> None:
     assert low_followup["actual_forward"], "a different run token must not consume another run's published handoff"
 
 
+def _test_forecasted_high_tail_updates_handoff_boundary() -> None:
+    high_runtime = _make_runtime("wan22_high_noise", "bias_shift")
+    low_runtime = _make_runtime("wan22_low_noise", "bias_shift")
+
+    high_sigmas = torch.tensor([1.0, 0.8, 0.6, 0.4], dtype=torch.float32)
+    low_sigmas = torch.tensor([0.3, 0.1, 0.0], dtype=torch.float32)
+    opts = {
+        "sample_sigmas": high_sigmas,
+        "cond_or_uncond": [1, 0],
+        "spectrum_wan_run_token": 301,
+    }
+
+    saw_forecast = False
+    for i in range(high_sigmas.numel() - 1):
+        decision = high_runtime.begin_step(opts, torch.tensor([high_sigmas[i]]))
+        if decision["actual_forward"]:
+            high_runtime.observe_feature(
+                opts,
+                decision["step_idx"],
+                torch.full((1, 4, 8), float(i + 1), dtype=torch.float32),
+                global_step=decision["global_step"],
+            )
+        else:
+            saw_forecast = True
+
+    assert saw_forecast, "test requires a forecasted high-noise tail"
+
+    low_opts = {
+        "sample_sigmas": low_sigmas,
+        "cond_or_uncond": [1, 0],
+        "spectrum_wan_run_token": 301,
+    }
+    low_start = low_runtime.begin_step(low_opts, torch.tensor([low_sigmas[0]]))
+    assert low_start["global_step"] == 3, "low-noise phase must anchor to the processed high-phase boundary"
+
+
+def _test_global_step_override_advances_and_reanchors() -> None:
+    high_runtime = _make_runtime("wan22_high_noise", "bias_shift")
+    low_runtime = _make_runtime("wan22_low_noise", "bias_shift")
+
+    high_sigmas = torch.tensor([1.0, 0.8, 0.6], dtype=torch.float32)
+    low_sigmas = torch.tensor([0.5, 0.35, 0.2, 0.0], dtype=torch.float32)
+    run_token = 401
+
+    _publish_high_handoff(high_runtime, high_sigmas, run_token, [2, 2])
+
+    low_opts = {
+        "sample_sigmas": low_sigmas,
+        "cond_or_uncond": [2, 2],
+        "spectrum_wan_run_token": run_token,
+        "spectrum_wan_global_step_override": 10,
+    }
+
+    low_start = low_runtime.begin_step(low_opts, torch.tensor([low_sigmas[0]]))
+    assert low_start["global_step"] == 10
+    low_runtime.observe_feature(
+        low_opts,
+        low_start["step_idx"],
+        torch.full((1, 4, 8), 9.0, dtype=torch.float32),
+        global_step=low_start["global_step"],
+    )
+    predictor = low_runtime._stream(low_opts).bias_shift_predictor
+    assert predictor is not None
+    assert predictor.total_steps(low_runtime.num_steps(), low_start["step_idx"], low_start["global_step"]) == 13
+
+    low_followup = low_runtime.begin_step(low_opts, torch.tensor([low_sigmas[1]]))
+    assert low_followup["global_step"] == 11
+    assert predictor.total_steps(low_runtime.num_steps(), low_followup["step_idx"], low_followup["global_step"]) == 13
+
+    low_opts["spectrum_wan_global_step_override"] = 20
+    low_reanchored = low_runtime.begin_step(low_opts, torch.tensor([low_sigmas[2]]))
+    assert low_reanchored["global_step"] == 20
+    assert predictor.total_steps(low_runtime.num_steps(), low_reanchored["step_idx"], low_reanchored["global_step"]) == 21
+
+
+def _test_unsupported_bias_shift_backends_raise() -> None:
+    _expect_value_error(
+        lambda: SpectrumWanConfig(backend="wan21", transition_mode="bias_shift").validated(),
+        "requires backend",
+    )
+
+    cfg = SpectrumWanConfig(backend="auto", transition_mode="bias_shift").validated()
+    handler = resolve_handler(cfg.backend, DummyTi2vModel())
+    assert handler.backend_id == "wan22_ti2v_5b"
+    _expect_value_error(
+        lambda: SpectrumWanRuntime(cfg, handler),
+        "after handler resolution",
+    )
+
+
+def _test_malformed_metadata_raises() -> None:
+    run_token_runtime = _make_runtime("wan22_high_noise", "separate_fit")
+    _expect_value_error(
+        lambda: run_token_runtime.begin_step(
+            {
+                "sample_sigmas": torch.tensor([1.0, 0.0], dtype=torch.float32),
+                "cond_or_uncond": [0],
+                "spectrum_wan_run_token": "bad-token",
+            },
+            torch.tensor([1.0], dtype=torch.float32),
+        ),
+        "spectrum_wan_run_token",
+    )
+
+    global_step_runtime = _make_runtime("wan22_high_noise", "separate_fit")
+    _expect_value_error(
+        lambda: global_step_runtime.begin_step(
+            {
+                "sample_sigmas": torch.tensor([1.0, 0.0], dtype=torch.float32),
+                "cond_or_uncond": [0],
+                "spectrum_wan_global_step_override": "bad-step",
+            },
+            torch.tensor([1.0], dtype=torch.float32),
+        ),
+        "spectrum_wan_global_step_override",
+    )
+
+
 def main() -> None:
     _test_split_schedule_bias_shift()
     _test_run_token_mismatch_falls_back()
+    _test_forecasted_high_tail_updates_handoff_boundary()
+    _test_global_step_override_advances_and_reanchors()
+    _test_unsupported_bias_shift_backends_raise()
+    _test_malformed_metadata_raises()
     print("ok")
 
 

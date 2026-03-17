@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from .config import SpectrumWanConfig
+from .config import SpectrumWanConfig, bias_shift_backend_supported
 from .forecast import ChebyshevFeatureForecaster
 from .handlers import WanBackendHandler, handler_metadata
 
@@ -72,8 +72,10 @@ class _BiasShiftPredictor:
             return int(explicit_global_step)
         return int(self.low_phase_offset + int(low_step_idx))
 
-    def total_steps(self, local_total_steps: int) -> int:
-        return max(int(self.total_steps_hint), int(self.low_phase_offset + local_total_steps), 1)
+    def total_steps(self, local_total_steps: int, low_step_idx: int, explicit_global_step: Optional[int] = None) -> int:
+        current_global = self.global_step(low_step_idx, explicit_global_step)
+        remaining_local = max(int(local_total_steps) - int(low_step_idx), 1)
+        return max(int(self.total_steps_hint), int(current_global + remaining_local), 1)
 
     def set_bias(self, actual_feature: torch.Tensor, low_step_idx: int, explicit_global_step: Optional[int], local_total_steps: int) -> bool:
         actual = actual_feature.detach()
@@ -83,7 +85,10 @@ class _BiasShiftPredictor:
             return False
 
         global_step = self.global_step(low_step_idx, explicit_global_step)
-        predicted = self.forecaster.predict(global_step, self.total_steps(local_total_steps))
+        predicted = self.forecaster.predict(
+            global_step,
+            self.total_steps(local_total_steps, low_step_idx, explicit_global_step),
+        )
         predicted = predicted.to(device=actual.device, dtype=actual.dtype)
         if predicted.shape != actual.shape or not torch.isfinite(predicted).all():
             return False
@@ -97,7 +102,10 @@ class _BiasShiftPredictor:
         if self.bias_delta is None:
             raise RuntimeError("Bias-shift predictor is not initialized.")
         global_step = self.global_step(low_step_idx, explicit_global_step)
-        predicted = self.forecaster.predict(global_step, self.total_steps(local_total_steps))
+        predicted = self.forecaster.predict(
+            global_step,
+            self.total_steps(local_total_steps, low_step_idx, explicit_global_step),
+        )
         predicted = predicted.to(device=self.bias_delta.device, dtype=self.feature_dtype)
         if predicted.shape != self.feature_shape:
             raise RuntimeError("Bias-shift predictor shape mismatch.")
@@ -122,6 +130,10 @@ class _StreamState:
     bias_shift_predictor: Optional[_BiasShiftPredictor] = None
     bias_shift_attempted: bool = False
     run_token: Optional[int] = None
+    last_processed_global_step: Optional[int] = None
+    global_step_override_raw: Optional[int] = None
+    global_step_override_anchor: Optional[int] = None
+    global_step_override_anchor_step_idx: int = 0
 
     def __post_init__(self) -> None:
         self.curr_ws = float(self.cfg.window_size)
@@ -145,6 +157,10 @@ class _StreamState:
         self.bias_shift_predictor = None
         self.bias_shift_attempted = False
         self.run_token = None
+        self.last_processed_global_step = None
+        self.global_step_override_raw = None
+        self.global_step_override_anchor = None
+        self.global_step_override_anchor_step_idx = 0
         assert self.forecaster is not None
         self.forecaster.reset()
 
@@ -153,6 +169,7 @@ class SpectrumWanRuntime:
     def __init__(self, cfg: SpectrumWanConfig, handler: WanBackendHandler):
         self.cfg = cfg.validated()
         self.handler = handler
+        self._validate_handler_transition_mode()
         self._last_schedule_signature = None
         self.streams: Dict[Tuple[str, Tuple[int, ...]], _StreamState] = {}
         self.run_id = 0
@@ -188,6 +205,7 @@ class SpectrumWanRuntime:
                 _TRANSITION_HANDOFFS.pop(handoff_key, None)
         self.cfg = cfg.validated()
         self.handler = handler
+        self._validate_handler_transition_mode()
         self.streams = {}
         self._last_schedule_signature = None
         self.run_id = 0
@@ -200,6 +218,21 @@ class SpectrumWanRuntime:
             }
         )
 
+    def _validate_handler_transition_mode(self) -> None:
+        if self.cfg.transition_mode == "bias_shift" and not bias_shift_backend_supported(self.handler.backend_id):
+            raise ValueError(
+                "transition_mode 'bias_shift' requires backend "
+                "'wan22_high_noise' or 'wan22_low_noise' after handler resolution."
+            )
+
+    def _parse_metadata_int(self, value: Any, key: str) -> int:
+        if isinstance(value, int):
+            return int(value)
+        try:
+            return int(value)
+        except Exception as exc:
+            raise ValueError(f"{key} must be an integer, got {value!r}.") from exc
+
     def _schedule_signature(self, transformer_options: Dict[str, Any]):
         sample_sigmas = transformer_options.get("sample_sigmas", None)
         if sample_sigmas is None:
@@ -210,7 +243,7 @@ class SpectrumWanRuntime:
         except Exception:
             return None
 
-    def _resolve_run_token(self, transformer_options: Dict[str, Any]) -> Optional[int]:
+    def _resolve_run_token(self, transformer_options: Dict[str, Any]) -> int:
         token = transformer_options.get(_RUN_TOKEN_KEY)
         if isinstance(token, int):
             return token
@@ -218,12 +251,15 @@ class SpectrumWanRuntime:
             token = int(next(_RUN_TOKEN_COUNTER))
             transformer_options[_RUN_TOKEN_KEY] = token
             return token
-        try:
-            token = int(token)
-        except Exception:
-            return None
+        token = self._parse_metadata_int(token, _RUN_TOKEN_KEY)
         transformer_options[_RUN_TOKEN_KEY] = token
         return token
+
+    def _resolve_global_step_override(self, transformer_options: Dict[str, Any]) -> Optional[int]:
+        override = transformer_options.get(_GLOBAL_STEP_OVERRIDE_KEY)
+        if override is None:
+            return None
+        return self._parse_metadata_int(override, _GLOBAL_STEP_OVERRIDE_KEY)
 
     def _stream_subkey(self, transformer_options: Dict[str, Any]) -> Tuple[int, ...]:
         cond_or_uncond = transformer_options.get("cond_or_uncond", None)
@@ -279,13 +315,11 @@ class SpectrumWanRuntime:
         self,
         transformer_options: Dict[str, Any],
         stream: _StreamState,
-    ) -> Optional[Tuple[int, Tuple[int, ...], str]]:
+    ) -> Tuple[int, Tuple[int, ...], str]:
         run_token = stream.run_token
         if run_token is None:
             run_token = self._resolve_run_token(transformer_options)
             stream.run_token = run_token
-        if run_token is None:
-            return None
         return (run_token, self._stream_subkey(transformer_options), _HIGH_TO_LOW_DIRECTION)
 
     def _store_transition_handoff(
@@ -302,23 +336,24 @@ class SpectrumWanRuntime:
     def _publish_bias_shift_handoff(self, transformer_options: Dict[str, Any], stream: _StreamState) -> None:
         if len(stream.actual_history) < 2:
             return
-        key = self._handoff_key(transformer_options, stream)
-        if key is None:
+        boundary_step = stream.last_processed_global_step
+        if boundary_step is None:
             return
+        key = self._handoff_key(transformer_options, stream)
 
         latest_feature = stream.actual_history[-1][1]
         history = [
             (
                 int(global_step),
-                feature.detach().to(device="cpu"),
+                feature,
             )
             for global_step, feature in stream.actual_history
         ]
         handoff = _PublishedTransitionHandoff(
             run_token=key[0],
             history=history,
-            next_global_step=int(stream.actual_history[-1][0]) + 1,
-            total_steps_hint=max(int(stream.actual_history[-1][0]) + 1, self.num_steps()),
+            next_global_step=int(boundary_step) + 1,
+            total_steps_hint=max(int(boundary_step) + 1, self.num_steps()),
             feature_shape=latest_feature.shape,
             feature_dtype=latest_feature.dtype,
         )
@@ -327,8 +362,6 @@ class SpectrumWanRuntime:
     def _consume_bias_shift_handoff(self, transformer_options: Dict[str, Any]) -> Optional[_PublishedTransitionHandoff]:
         stream = self._stream(transformer_options)
         key = self._handoff_key(transformer_options, stream)
-        if key is None:
-            return None
         return _TRANSITION_HANDOFFS.pop(key, None)
 
     def _global_step(
@@ -337,12 +370,17 @@ class SpectrumWanRuntime:
         stream: _StreamState,
         step_idx: int,
     ) -> int:
-        explicit_global_step = transformer_options.get(_GLOBAL_STEP_OVERRIDE_KEY)
+        explicit_global_step = self._resolve_global_step_override(transformer_options)
         if explicit_global_step is not None:
-            try:
-                return int(explicit_global_step)
-            except Exception:
-                pass
+            if stream.global_step_override_raw != explicit_global_step:
+                stream.global_step_override_raw = explicit_global_step
+                stream.global_step_override_anchor = explicit_global_step
+                stream.global_step_override_anchor_step_idx = int(step_idx)
+            assert stream.global_step_override_anchor is not None
+            return int(stream.global_step_override_anchor + (int(step_idx) - int(stream.global_step_override_anchor_step_idx)))
+        stream.global_step_override_raw = None
+        stream.global_step_override_anchor = None
+        stream.global_step_override_anchor_step_idx = 0
         if stream.bias_shift_predictor is not None:
             return stream.bias_shift_predictor.global_step(step_idx)
         return int(step_idx)
@@ -377,6 +415,7 @@ class SpectrumWanRuntime:
                     stream.bias_shift_predictor = _BiasShiftPredictor.from_handoff(self.cfg, handoff)
 
         global_step = self._global_step(transformer_options, stream, step_idx)
+        stream.last_processed_global_step = int(global_step)
         transformer_options[_GLOBAL_STEP_KEY] = int(global_step)
 
         if step_idx >= self.cfg.warmup_steps:
@@ -409,6 +448,8 @@ class SpectrumWanRuntime:
             "stream_key": self._stream_key(transformer_options),
         }
         stream.decisions_by_sigma[sigma] = decision
+        if self._should_publish_bias_shift_handoff() and not actual_forward:
+            self._publish_bias_shift_handoff(transformer_options, stream)
         return decision
 
     def observe_feature(
@@ -422,12 +463,11 @@ class SpectrumWanRuntime:
         assert stream.forecaster is not None
         stream.forecaster.update(step_idx, feature)
         feature_ref = feature.detach()
-        step_for_history = int(step_idx if global_step is None else global_step)
-        stream.actual_history.append((step_for_history, feature_ref))
-        if len(stream.actual_history) > self.cfg.history_size:
-            stream.actual_history.pop(0)
-
         if self._should_publish_bias_shift_handoff():
+            step_for_history = int(step_idx if global_step is None else global_step)
+            stream.actual_history.append((step_for_history, feature_ref.to(device="cpu")))
+            if len(stream.actual_history) > self.cfg.history_size:
+                stream.actual_history.pop(0)
             self._publish_bias_shift_handoff(transformer_options, stream)
 
         if stream.bias_shift_predictor is not None:

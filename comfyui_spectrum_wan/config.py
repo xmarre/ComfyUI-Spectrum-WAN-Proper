@@ -16,6 +16,15 @@ _VALID_TRANSITION_MODES = {
     "bias_shift",
 }
 
+_BIAS_SHIFT_BACKENDS = {
+    "wan22_high_noise",
+    "wan22_low_noise",
+}
+
+
+def bias_shift_backend_supported(backend: str) -> bool:
+    return backend in _BIAS_SHIFT_BACKENDS
+
 
 @dataclass
 class SpectrumWanConfig:
@@ -37,6 +46,11 @@ class SpectrumWanConfig:
             raise ValueError(f"Unsupported backend '{self.backend}'.")
         if self.transition_mode not in _VALID_TRANSITION_MODES:
             raise ValueError(f"Unsupported transition_mode '{self.transition_mode}'.")
+        if self.transition_mode == "bias_shift" and self.backend != "auto" and not bias_shift_backend_supported(self.backend):
+            raise ValueError(
+                "transition_mode 'bias_shift' requires backend "
+                "'wan22_high_noise' or 'wan22_low_noise'."
+            )
         if not (0.0 <= float(self.blend_weight) <= 1.0):
             raise ValueError("blend_weight must be in [0, 1].")
         if int(self.degree) < 1:
