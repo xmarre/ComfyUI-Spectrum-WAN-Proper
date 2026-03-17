@@ -1,4 +1,4 @@
-# ComfyUI Spectrum WAN Native
+# ComfyUI Spectrum WAN Proper
 
 Native ComfyUI custom node repo that ports **Spectrum** to the **WAN video backend** with **backend-specific handlers** for:
 
@@ -47,7 +47,7 @@ This is deliberate. It avoids pretending the two experts share one stationary fe
 Clone or copy this repository into your ComfyUI `custom_nodes` directory:
 
 ```bash
-git clone <this-repo> ComfyUI/custom_nodes/ComfyUI-Spectrum-WAN-Native
+git clone https://github.com/xmarre/ComfyUI-Spectrum-WAN-Proper ComfyUI/custom_nodes/ComfyUI-Spectrum-WAN-Proper
 ```
 
 Then restart ComfyUI.
@@ -200,7 +200,7 @@ This repo reproduces the current internal WAN `forward_orig(...)` structure clos
 ## Repo structure
 
 ```text
-ComfyUI-Spectrum-WAN-Native/
+ComfyUI-Spectrum-WAN-Proper/
 ├── __init__.py
 ├── nodes.py
 ├── pyproject.toml
