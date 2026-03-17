@@ -212,11 +212,15 @@ class SpectrumWanRuntime:
     def _new_stream(self) -> _StreamState:
         return _StreamState(self.cfg)
 
-    def reset_all(self) -> None:
+    def _cleanup_transition_handoffs(self) -> None:
         for key, stream in self.streams.items():
             if stream.run_token is not None:
                 handoff_key = (int(stream.run_token), key[1], _HIGH_TO_LOW_DIRECTION)
                 _TRANSITION_HANDOFFS.pop(handoff_key, None)
+
+    def reset_all(self) -> None:
+        self._cleanup_transition_handoffs()
+        for stream in self.streams.values():
             stream.reset()
         self.last_info["run_id"] = self.run_id
         self.last_info["num_steps"] = self.last_info.get("num_steps", 0)
@@ -224,10 +228,7 @@ class SpectrumWanRuntime:
         self.last_info["config"] = asdict(self.cfg)
 
     def update(self, cfg: SpectrumWanConfig, handler: WanBackendHandler) -> None:
-        for key, stream in self.streams.items():
-            if stream.run_token is not None:
-                handoff_key = (int(stream.run_token), key[1], _HIGH_TO_LOW_DIRECTION)
-                _TRANSITION_HANDOFFS.pop(handoff_key, None)
+        self._cleanup_transition_handoffs()
         self.cfg = cfg.validated()
         self.handler = handler
         self._validate_handler_transition_mode()
