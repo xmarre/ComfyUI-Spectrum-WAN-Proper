@@ -1,6 +1,6 @@
 # ComfyUI Spectrum WAN Proper
 
-Native ComfyUI custom node repo that ports **Spectrum** to the **WAN video backend** with **backend-specific handlers** for:
+Native ComfyUI custom node repo that ports [Spectrum](https://hanjq17.github.io/Spectrum/) from [Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration](https://arxiv.org/abs/2603.01623) to the **WAN video backend** with **backend-specific handlers** for:
 
 - **Wan 2.1**
 - **Wan 2.2 TI2V 5B**
@@ -21,7 +21,7 @@ For the native ComfyUI WAN backend, this repo:
 4. predicts the final hidden feature on skipped steps,
 5. runs the normal WAN **head + unpatchify** on the predicted feature.
 
-That is the WAN analogue of the official Spectrum design: forecast the **final block output**, not arbitrary module activations or the outer model wrapper output.
+That is the WAN analogue of the official [Spectrum](https://hanjq17.github.io/Spectrum/) design: forecast the **final block output**, not arbitrary module activations or the outer model wrapper output.
 
 ## Why WAN gets backend-specific handlers
 
@@ -230,3 +230,11 @@ Expected output:
 ```text
 ok
 ```
+
+## References and credits
+
+- [Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration](https://arxiv.org/abs/2603.01623)
+- [Spectrum project page](https://hanjq17.github.io/Spectrum/)
+- [Official Spectrum code](https://github.com/hanjq17/Spectrum)
+
+This repository is an unofficial ComfyUI adaptation of the original Spectrum method for native WAN backends. Credit for the underlying method, paper, and reference implementation goes to the original Spectrum authors.
