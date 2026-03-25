@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import sys
 from dataclasses import asdict, dataclass, field
 from itertools import count
 from typing import Any, Dict, List, Optional, Tuple
@@ -208,6 +209,14 @@ class SpectrumWanRuntime:
             "config": asdict(self.cfg),
             "handler": handler_metadata(self.handler),
         }
+
+    def _debug_log(self, message: str) -> None:
+        if not self.cfg.debug:
+            return
+        try:
+            print(message, file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
     def _new_stream(self) -> _StreamState:
         return _StreamState(self.cfg)
@@ -490,6 +499,22 @@ class SpectrumWanRuntime:
             "phase_tag": self.handler.phase_tag,
             "stream_key": self._stream_key(transformer_options),
         }
+        forecast_ready = (
+            (stream.bias_shift_predictor is not None and stream.bias_shift_predictor.ready())
+            or (stream.forecaster is not None and stream.forecaster.ready())
+        )
+        self._debug_log(
+            "[Spectrum WAN] "
+            f"run_id={self.run_id} "
+            f"backend={self.handler.backend_id} "
+            f"phase={self.handler.phase_tag} "
+            f"step={step_idx} "
+            f"global_step={global_step} "
+            f"sigma={sigma:.8f} "
+            f"actual_forward={actual_forward} "
+            f"curr_ws={stream.curr_ws:.3f} "
+            f"forecast_ready={forecast_ready}"
+        )
         stream.decisions_by_sigma[sigma] = decision
         if self._should_publish_bias_shift_handoff() and not actual_forward:
             self._publish_bias_shift_handoff(transformer_options, stream)
