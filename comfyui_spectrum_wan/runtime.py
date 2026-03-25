@@ -499,9 +499,10 @@ class SpectrumWanRuntime:
             "phase_tag": self.handler.phase_tag,
             "stream_key": self._stream_key(transformer_options),
         }
-        forecast_ready = (
-            (stream.bias_shift_predictor is not None and stream.bias_shift_predictor.ready())
-            or (stream.forecaster is not None and stream.forecaster.ready())
+        forecast_ready = has_ready_transfer or (
+            stream.bias_shift_predictor is None
+            and stream.forecaster is not None
+            and stream.forecaster.ready()
         )
         self._debug_log(
             "[Spectrum WAN] "

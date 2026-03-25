@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -61,3 +62,27 @@ def test_begin_step_debug_false_stays_silent(capsys) -> None:
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+def test_begin_step_debug_prefers_unready_bias_shift_over_ready_local_forecaster(capsys) -> None:
+    runtime = _runtime(debug=True)
+    runtime.cfg.warmup_steps = 0
+    sample_sigmas = torch.linspace(1.0, 0.0, 6)
+    transformer_options = {"sample_sigmas": sample_sigmas, "cond_or_uncond": [0, 1]}
+
+    stream = runtime._stream(transformer_options)
+    assert stream.forecaster is not None
+    stream.forecaster.update(0, torch.ones((1, 2, 2)))
+    stream.forecaster.update(1, torch.ones((1, 2, 2)) * 2)
+    assert stream.forecaster.ready()
+
+    stream.bias_shift_predictor = SimpleNamespace(
+        ready=lambda: False,
+        global_step=lambda step_idx: step_idx,
+    )
+
+    runtime.begin_step(transformer_options, torch.tensor([sample_sigmas[0]]))
+
+    captured = capsys.readouterr()
+    assert "actual_forward=True" in captured.err
+    assert "forecast_ready=False" in captured.err
