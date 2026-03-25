@@ -75,7 +75,7 @@ No additional dependencies are required beyond normal ComfyUI requirements.
 - `flex_window` — amount added to the window after each actual forward
 - `warmup_steps` — number of initial actual forwards
 - `history_size` — number of actual WAN features to retain for fitting
-- `debug` — stored in runtime metadata only
+- `debug` — emit runtime step decisions to stderr
 
 **Output**
 
