@@ -53,10 +53,18 @@ def _looks_like_wan(inner: Any) -> bool:
     return all(hasattr(inner, name) for name in required)
 
 
-def _resolve_runtime(transformer_options: Dict[str, Any]) -> Optional[SpectrumWanRuntime]:
-    runtime = transformer_options.get(_RUNTIME_KEY)
-    if isinstance(runtime, SpectrumWanRuntime):
-        return runtime
+def _resolve_runtime(
+    transformer_options: Optional[Dict[str, Any]],
+    inner: Optional[Any] = None,
+) -> Optional[SpectrumWanRuntime]:
+    if isinstance(transformer_options, dict):
+        runtime = transformer_options.get(_RUNTIME_KEY)
+        if isinstance(runtime, SpectrumWanRuntime):
+            return runtime
+    if inner is not None:
+        runtime = getattr(inner, "_spectrum_wan_runtime", None)
+        if isinstance(runtime, SpectrumWanRuntime):
+            return runtime
     return None
 
 
@@ -75,7 +83,7 @@ def _wrap_wan_forward_orig(inner: Any) -> None:
         transformer_options={},
         **kwargs,
     ):
-        runtime = _resolve_runtime(transformer_options)
+        runtime = _resolve_runtime(transformer_options, inner)
         if runtime is None or not runtime.cfg.enabled:
             return original_forward_orig(x, t, context, clip_fea=clip_fea, freqs=freqs, transformer_options=transformer_options, **kwargs)
 
@@ -208,6 +216,7 @@ class WanSpectrumPatcher:
         runtime.last_info["hook_target"] = inner_name
 
         if inner is not None and _looks_like_wan(inner):
+            inner._spectrum_wan_runtime = runtime
             _wrap_wan_forward_orig(inner)
             runtime.last_info["patched"] = True
         else:
