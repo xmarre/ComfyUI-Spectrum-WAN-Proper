@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
 from comfyui_spectrum_wan.config import SpectrumWanConfig
 from comfyui_spectrum_wan.handlers import resolve_handler
 from comfyui_spectrum_wan.runtime import SpectrumWanRuntime
-from comfyui_spectrum_wan.wan import _RUNTIME_KEY, WanSpectrumPatcher
+from comfyui_spectrum_wan.wan import _RUNTIME_KEY, _run_spectrum_forward, WanSpectrumPatcher
 
 
 class DummyInner:
@@ -192,3 +192,78 @@ def test_patcher_prefers_forward_orig_over_legacy_forward_when_no__forward() -> 
 
     assert inner._spectrum_wan_wrapped_attr == "forward_orig"
     assert inner._spectrum_wan_runtime.last_info["hook_target"] == "model.diffusion_model.forward_orig"
+
+
+def test_run_spectrum_forward_records_forecast_errors_and_falls_back(capsys) -> None:
+    inner = DummyInner()
+
+    class RuntimeStub:
+        def __init__(self) -> None:
+            self.last_info = {}
+            self.observed = []
+
+        def begin_step(self, transformer_options, timesteps):
+            return {"step_idx": 2, "actual_forward": False, "global_step": 7}
+
+        def can_forecast(self, transformer_options):
+            return True
+
+        def predict_feature(self, transformer_options, step_idx, global_step=None):
+            raise RuntimeError("forecast broke")
+
+        def _debug_log(self, message: str) -> None:
+            print(message, file=sys.stderr, flush=True)
+
+        def observe_feature(self, transformer_options, step_idx, feature, global_step=None):
+            self.observed.append((step_idx, global_step, tuple(feature.shape)))
+
+    runtime = RuntimeStub()
+    out = _run_spectrum_forward(
+        inner,
+        runtime,
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        transformer_options={},
+    )
+
+    captured = capsys.readouterr()
+    assert torch.is_tensor(out)
+    assert runtime.observed == [(2, 7, (1, 4, 1))]
+    assert runtime.last_info["forecast_error"] == "RuntimeError: forecast broke"
+    assert "forecast_error step=2 global_step=7 RuntimeError: forecast broke" in captured.err
+
+
+def test_run_spectrum_forward_clears_stale_forecast_error_before_non_forecast_step() -> None:
+    inner = DummyInner()
+
+    class RuntimeStub:
+        def __init__(self) -> None:
+            self.last_info = {"forecast_error": "stale"}
+            self.observed = []
+
+        def begin_step(self, transformer_options, timesteps):
+            return {"step_idx": 3, "actual_forward": True, "global_step": 8}
+
+        def can_forecast(self, transformer_options):
+            raise AssertionError("can_forecast should not run when actual_forward is True")
+
+        def _debug_log(self, message: str) -> None:
+            pass
+
+        def observe_feature(self, transformer_options, step_idx, feature, global_step=None):
+            self.observed.append((step_idx, global_step, tuple(feature.shape)))
+
+    runtime = RuntimeStub()
+    out = _run_spectrum_forward(
+        inner,
+        runtime,
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        transformer_options={},
+    )
+
+    assert torch.is_tensor(out)
+    assert "forecast_error" not in runtime.last_info
+    assert runtime.observed == [(3, 8, (1, 4, 1))]

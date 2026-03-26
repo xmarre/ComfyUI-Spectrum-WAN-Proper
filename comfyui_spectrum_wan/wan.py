@@ -108,6 +108,8 @@ def _run_spectrum_forward(
             full_ref = inner.ref_conv(full_ref).flatten(2).transpose(1, 2)
             x = torch.concat((full_ref, x), dim=1)
 
+    runtime.last_info.pop("forecast_error", None)
+
     if not actual_forward and runtime.can_forecast(transformer_options):
         try:
             predicted_x = runtime.predict_feature(
@@ -115,7 +117,12 @@ def _run_spectrum_forward(
                 step_idx,
                 global_step=decision.get("global_step"),
             )
-        except Exception:
+        except Exception as exc:
+            runtime.last_info["forecast_error"] = f"{type(exc).__name__}: {exc}"
+            runtime._debug_log(
+                f"[Spectrum WAN] forecast_error step={step_idx} "
+                f"global_step={decision.get('global_step')} {type(exc).__name__}: {exc}"
+            )
             predicted_x = None
 
         if predicted_x is not None:

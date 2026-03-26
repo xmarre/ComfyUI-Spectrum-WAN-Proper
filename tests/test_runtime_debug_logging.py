@@ -19,6 +19,14 @@ class DummyModel:
     model_name = "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors"
 
 
+class _DetachFailure:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    def detach(self):
+        raise RuntimeError(self.message)
+
+
 def _runtime(debug: bool) -> SpectrumWanRuntime:
     cfg = SpectrumWanConfig(
         backend="auto",
@@ -49,6 +57,7 @@ def test_begin_step_debug_logs_to_stderr(capsys) -> None:
     assert "phase=wan22_high_noise" in captured.err
     assert "step=0" in captured.err
     assert "global_step=0" in captured.err
+    assert "num_steps=5" in captured.err
     assert "actual_forward=True" in captured.err
 
 
@@ -86,3 +95,37 @@ def test_begin_step_debug_prefers_unready_bias_shift_over_ready_local_forecaster
     captured = capsys.readouterr()
     assert "actual_forward=True" in captured.err
     assert "forecast_ready=False" in captured.err
+
+
+def test_schedule_signature_failure_sets_last_info_and_logs(capsys) -> None:
+    runtime = _runtime(debug=True)
+
+    assert runtime._schedule_signature({"sample_sigmas": _DetachFailure("bad sigmas")}) is None
+
+    captured = capsys.readouterr()
+    assert "schedule_signature_error=RuntimeError: bad sigmas" in captured.err
+    assert runtime.last_info["schedule_signature_source"] == "error"
+    assert runtime.last_info["schedule_signature_error"] == "RuntimeError: bad sigmas"
+
+
+def test_sigma_key_fallback_logs_sigmas_failure_and_uses_timesteps(capsys) -> None:
+    runtime = _runtime(debug=True)
+
+    sigma = runtime.sigma_key({"sigmas": _DetachFailure("bad sigma key")}, torch.tensor([0.25]))
+
+    captured = capsys.readouterr()
+    assert sigma == 0.25
+    assert "sigma_key_error(sigmas)=RuntimeError: bad sigma key" in captured.err
+    assert runtime.last_info["sigma_key_source"] == "timesteps"
+    assert runtime.last_info["sigma_key_error"] == "RuntimeError: bad sigma key"
+
+
+def test_sigma_key_total_failure_logs_timesteps_error_and_returns_zero(capsys) -> None:
+    runtime = _runtime(debug=True)
+
+    sigma = runtime.sigma_key({"sigmas": _DetachFailure("bad sigma key")}, _DetachFailure("bad timesteps"))
+
+    captured = capsys.readouterr()
+    assert sigma == 0.0
+    assert "sigma_key_error(timesteps)=RuntimeError: bad timesteps" in captured.err
+    assert runtime.last_info["sigma_key_error"] == "RuntimeError: bad timesteps"
