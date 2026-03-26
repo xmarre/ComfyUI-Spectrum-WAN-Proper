@@ -280,11 +280,21 @@ class SpectrumWanRuntime:
     def _schedule_signature(self, transformer_options: Dict[str, Any]):
         sample_sigmas = transformer_options.get("sample_sigmas", None)
         if sample_sigmas is None:
+            self.last_info["schedule_signature_source"] = "missing"
+            self.last_info.pop("schedule_signature_len", None)
+            self.last_info.pop("schedule_signature_error", None)
             return None
         try:
             vals = sample_sigmas.detach().float().cpu().flatten().tolist()
+            self.last_info["schedule_signature_source"] = "sample_sigmas"
+            self.last_info["schedule_signature_len"] = len(vals)
+            self.last_info.pop("schedule_signature_error", None)
             return tuple(round(float(v), 8) for v in vals)
-        except Exception:
+        except Exception as exc:
+            self.last_info["schedule_signature_source"] = "error"
+            self.last_info.pop("schedule_signature_len", None)
+            self.last_info["schedule_signature_error"] = f"{type(exc).__name__}: {exc}"
+            self._debug_log(f"[Spectrum WAN] schedule_signature_error={type(exc).__name__}: {exc}")
             return None
 
     def _resolve_run_token(self, transformer_options: Dict[str, Any]) -> int:
@@ -337,14 +347,23 @@ class SpectrumWanRuntime:
 
     def sigma_key(self, transformer_options: Dict[str, Any], timesteps: torch.Tensor) -> float:
         sigmas = transformer_options.get("sigmas", None)
+        self.last_info.pop("sigma_key_source", None)
+        self.last_info.pop("sigma_key_error", None)
         if sigmas is not None:
             try:
-                return round(float(sigmas.detach().flatten()[0].item()), 8)
-            except Exception:
-                pass
+                out = round(float(sigmas.detach().flatten()[0].item()), 8)
+                self.last_info["sigma_key_source"] = "sigmas"
+                return out
+            except Exception as exc:
+                self.last_info["sigma_key_error"] = f"{type(exc).__name__}: {exc}"
+                self._debug_log(f"[Spectrum WAN] sigma_key_error(sigmas)={type(exc).__name__}: {exc}")
         try:
-            return round(float(timesteps.detach().flatten()[0].item()), 8)
-        except Exception:
+            out = round(float(timesteps.detach().flatten()[0].item()), 8)
+            self.last_info["sigma_key_source"] = "timesteps"
+            return out
+        except Exception as exc:
+            self.last_info["sigma_key_error"] = f"{type(exc).__name__}: {exc}"
+            self._debug_log(f"[Spectrum WAN] sigma_key_error(timesteps)={type(exc).__name__}: {exc}")
             return 0.0
 
     def _bias_shift_enabled(self) -> bool:
@@ -511,6 +530,7 @@ class SpectrumWanRuntime:
             f"phase={self.handler.phase_tag} "
             f"step={step_idx} "
             f"global_step={global_step} "
+            f"num_steps={self.num_steps()} "
             f"sigma={sigma:.8f} "
             f"actual_forward={actual_forward} "
             f"curr_ws={stream.curr_ws:.3f} "
