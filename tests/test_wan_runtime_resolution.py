@@ -68,6 +68,15 @@ class DummyOuter:
                 transformer_options=transformer_options,
                 **kwargs,
             )
+        if callable(self.diffusion_model):
+            return self.diffusion_model(
+                x,
+                timestep,
+                context,
+                clip_fea=clip_fea,
+                transformer_options=transformer_options,
+                **kwargs,
+            )
         return self.diffusion_model.forward_orig(
             x,
             timestep,
@@ -80,6 +89,25 @@ class DummyOuter:
 
 class NonWanInner:
     pass
+
+
+class DummyInnerWrapper:
+    def __init__(self, inner) -> None:
+        self.model = inner
+        self.forward_calls = 0
+        self.seen_transformer_options = None
+
+    def __call__(self, x, timestep, context, clip_fea=None, transformer_options=None, **kwargs):
+        self.forward_calls += 1
+        self.seen_transformer_options = transformer_options
+        return self.model.forward_orig(
+            x,
+            timestep,
+            context,
+            clip_fea=clip_fea,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
 
 
 class DummyModel:
@@ -226,6 +254,31 @@ def test_patcher_rebinds__forward_passthrough_when_live_inner_changes_before_app
     assert live_inner._spectrum_wan__forward_wrapped is True
 
 
+def test_patcher_rebinds_runtime_when_live_inner_is_wrapped_one_level_deeper() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModel(), _cfg())
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+
+    live_inner = DummyInner()
+    wrapped_live_inner = DummyInnerWrapper(live_inner)
+    patched.model.diffusion_model = wrapped_live_inner
+
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
+    out = patched.model.apply_model(
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([sample_sigmas[0]], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        transformer_options={"sample_sigmas": sample_sigmas, "cond_or_uncond": [0, 1]},
+    )
+
+    assert torch.is_tensor(out)
+    assert wrapped_live_inner.forward_calls == 1
+    assert wrapped_live_inner.seen_transformer_options[_RUNTIME_KEY] is runtime
+    assert live_inner._spectrum_wan_runtime is runtime
+    assert patched.model._spectrum_wan_bound_inner_id == id(live_inner)
+    assert runtime.last_info["live_inner_type"] == "DummyInner"
+    assert runtime.last_info["hook_target"] == "model.diffusion_model.model.forward_orig"
+
+
 def test_patcher_clears_live_binding_state_when_current_inner_is_not_wan_like() -> None:
     patched = WanSpectrumPatcher.patch(DummyModel(), _cfg())
     runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
@@ -247,6 +300,35 @@ def test_patcher_clears_live_binding_state_when_current_inner_is_not_wan_like() 
     assert runtime.last_info["hook_target"] == "model.diffusion_model"
     assert "live_inner_id" not in runtime.last_info
     assert "live_inner_type" not in runtime.last_info
+
+
+def test_successful_rebind_clears_stale_live_inner_root_type() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModel(), _cfg())
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+
+    patched.model.diffusion_model = NonWanInner()
+    try:
+        patched.model.apply_model(
+            torch.ones((1, 1, 2, 2), dtype=torch.float32),
+            torch.tensor([1.0], dtype=torch.float32),
+            torch.zeros((1, 1, 1), dtype=torch.float32),
+            transformer_options={},
+        )
+    except AttributeError:
+        pass
+
+    assert runtime.last_info["live_inner_root_type"] == "NonWanInner"
+
+    live_inner = DummyInner()
+    patched.model.diffusion_model = DummyInnerWrapper(live_inner)
+    patched.model.apply_model(
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        transformer_options={"sample_sigmas": torch.tensor([1.0, 0.5, 0.0]), "cond_or_uncond": [0, 1]},
+    )
+
+    assert "live_inner_root_type" not in runtime.last_info
 
 
 def test_patcher__forward_passthrough_overwrites_stale_runtime() -> None:

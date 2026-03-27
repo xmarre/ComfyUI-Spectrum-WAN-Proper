@@ -33,13 +33,11 @@ def _ensure_transformer_options(model: Any) -> Dict[str, Any]:
     return opts["transformer_options"]
 
 
-def _locate_inner_model(model: Any) -> Tuple[Optional[Any], Optional[str]]:
-    outer = getattr(model, "model", None)
-    if outer is not None and hasattr(outer, "diffusion_model"):
-        return outer.diffusion_model, "model.diffusion_model"
-    if hasattr(model, "diffusion_model"):
-        return model.diffusion_model, "diffusion_model"
-    return None, None
+def _iter_wrapper_children(obj: Any):
+    for attr in ("model", "diffusion_model", "inner_model", "module", "wrapped_model", "_orig_mod"):
+        child = getattr(obj, attr, None)
+        if child is not None and child is not obj:
+            yield attr, child
 
 
 def _bind_runtime_to_inner(
@@ -59,6 +57,7 @@ def _bind_runtime_to_inner(
     runtime.last_info["hook_target"] = f"{inner_name}.forward_orig" if inner_name else "forward_orig"
     runtime.last_info["live_inner_type"] = type(inner).__name__
     runtime.last_info["live_inner_id"] = id(inner)
+    runtime.last_info.pop("live_inner_root_type", None)
     return True
 
 
@@ -76,25 +75,31 @@ def _wrap_outer_apply_model(outer: Any, runtime: SpectrumWanRuntime) -> None:
     def wrapped_apply_model(*args, **kwargs):
         current_runtime = getattr(outer, "_spectrum_wan_runtime", None)
         if isinstance(current_runtime, SpectrumWanRuntime):
-            current_inner = getattr(outer, "diffusion_model", None)
+            current_root = getattr(outer, "diffusion_model", None)
+            current_inner, current_inner_name = _locate_wan_like_descendant(current_root, "model.diffusion_model")
             previously_bound_id = getattr(outer, "_spectrum_wan_bound_inner_id", None)
-            bound = _bind_runtime_to_inner(current_inner, current_runtime, "model.diffusion_model")
+            bound = _bind_runtime_to_inner(current_inner, current_runtime, current_inner_name)
             current_inner_id = id(current_inner) if bound else None
             outer._spectrum_wan_bound_inner_id = current_inner_id
 
             if bound and previously_bound_id != current_inner_id:
                 current_runtime._debug_log(
                     "[Spectrum WAN] rebound live inner "
+                    f"path={current_inner_name} "
                     f"type={type(current_inner).__name__} "
                     f"id={current_inner_id}"
                 )
             elif not bound:
                 current_runtime.last_info["patched"] = False
-                current_runtime.last_info["hook_target"] = "model.diffusion_model"
+                current_runtime.last_info["hook_target"] = current_inner_name or "model.diffusion_model"
+                current_runtime.last_info["live_inner_root_type"] = (
+                    type(current_root).__name__ if current_root is not None else None
+                )
                 current_runtime.last_info.pop("live_inner_type", None)
                 current_runtime.last_info.pop("live_inner_id", None)
                 current_runtime._debug_log(
-                    "[Spectrum WAN] live inner is not WAN-like; skipping runtime bind"
+                    "[Spectrum WAN] no WAN-like live inner under "
+                    f"root_type={current_runtime.last_info['live_inner_root_type']}"
                 )
 
         return original_apply_model(*args, **kwargs)
@@ -113,6 +118,38 @@ def _looks_like_wan(inner: Any) -> bool:
         "unpatchify",
     )
     return all(hasattr(inner, name) for name in required)
+
+
+def _locate_wan_like_descendant(root: Any, root_name: str) -> Tuple[Optional[Any], Optional[str]]:
+    if root is None:
+        return None, root_name
+
+    queue = [(root, root_name)]
+    seen = set()
+
+    while queue:
+        obj, name = queue.pop(0)
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+
+        if _looks_like_wan(obj):
+            return obj, name
+
+        for attr, child in _iter_wrapper_children(obj):
+            queue.append((child, f"{name}.{attr}"))
+
+    return None, root_name
+
+
+def _locate_inner_model(model: Any) -> Tuple[Optional[Any], Optional[str]]:
+    outer = getattr(model, "model", None)
+    if outer is not None and hasattr(outer, "diffusion_model"):
+        return _locate_wan_like_descendant(outer.diffusion_model, "model.diffusion_model")
+    if hasattr(model, "diffusion_model"):
+        return _locate_wan_like_descendant(model.diffusion_model, "diffusion_model")
+    return None, None
 
 
 def _resolve_runtime(
@@ -144,6 +181,7 @@ def _run_spectrum_forward(
     if transformer_options is None:
         transformer_options = {}
 
+    transformer_options[_RUNTIME_KEY] = runtime
     decision = runtime.begin_step(transformer_options, t)
     step_idx = decision["step_idx"]
     actual_forward = decision["actual_forward"]
