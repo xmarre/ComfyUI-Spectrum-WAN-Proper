@@ -134,6 +134,13 @@ def _wrap_outer_apply_model(outer: Any, runtime: SpectrumWanRuntime) -> None:
     def wrapped_apply_model(*args, **kwargs):
         current_runtime = getattr(outer, "_spectrum_wan_runtime", None)
         if isinstance(current_runtime, SpectrumWanRuntime):
+            transformer_options = kwargs.get("transformer_options")
+            if transformer_options is None:
+                transformer_options = {}
+                kwargs["transformer_options"] = transformer_options
+            if isinstance(transformer_options, dict):
+                transformer_options[_RUNTIME_KEY] = current_runtime
+
             current_root = getattr(outer, "diffusion_model", None)
             current_inner, current_inner_name = _locate_wan_like_descendant(current_root, "model.diffusion_model")
             previously_bound_id = getattr(outer, "_spectrum_wan_bound_inner_id", None)
@@ -211,14 +218,9 @@ def _locate_inner_model(model: Any) -> Tuple[Optional[Any], Optional[str]]:
 
 def _resolve_runtime(
     transformer_options: Optional[Dict[str, Any]],
-    inner: Optional[Any] = None,
 ) -> Optional[SpectrumWanRuntime]:
     if isinstance(transformer_options, dict):
         runtime = transformer_options.get(_RUNTIME_KEY)
-        if isinstance(runtime, SpectrumWanRuntime):
-            return runtime
-    if inner is not None:
-        runtime = getattr(inner, "_spectrum_wan_runtime", None)
         if isinstance(runtime, SpectrumWanRuntime):
             return runtime
     return None
@@ -373,7 +375,7 @@ def _wrap_wan_forward_orig(inner: Any) -> None:
         transformer_options=None,
         **kwargs,
     ):
-        runtime = _resolve_runtime(transformer_options, inner)
+        runtime = _resolve_runtime(transformer_options)
         if runtime is None or not runtime.cfg.enabled:
             if transformer_options is None:
                 return original_forward_orig(x, t, context, clip_fea=clip_fea, freqs=freqs, **kwargs)
@@ -443,9 +445,6 @@ def _wrap_wan__forward_passthrough(inner: Any) -> None:
     ):
         if transformer_options is None:
             transformer_options = {}
-        inner_runtime = getattr(inner, "_spectrum_wan_runtime", None)
-        if isinstance(inner_runtime, SpectrumWanRuntime):
-            transformer_options[_RUNTIME_KEY] = inner_runtime
         return original__forward(
             x,
             timestep,
