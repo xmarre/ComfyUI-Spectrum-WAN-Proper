@@ -180,21 +180,56 @@ def _cfg() -> SpectrumWanConfig:
     ).validated()
 
 
-def test_patched_wan_resolves_runtime_from_inner_model_when_call_options_are_fresh() -> None:
+def test_direct_forward_orig_requires_runtime_in_current_transformer_options() -> None:
     patched = WanSpectrumPatcher.patch(DummyModel(), _cfg())
     inner = patched.model.diffusion_model
 
     sample_sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
     out = inner.forward_orig(
         torch.ones((1, 1, 2, 2), dtype=torch.float32),
         torch.tensor([sample_sigmas[0]], dtype=torch.float32),
         torch.zeros((1, 1, 1), dtype=torch.float32),
-        transformer_options={"sample_sigmas": sample_sigmas, "cond_or_uncond": [0, 1]},
+        transformer_options={
+            _RUNTIME_KEY: runtime,
+            "sample_sigmas": sample_sigmas,
+            "cond_or_uncond": [0, 1],
+        },
     )
 
     assert torch.is_tensor(out)
     assert inner.original_calls == 0
     assert inner._spectrum_wan_runtime.last_info["last_sigma"] == 1.0
+
+
+def test_patched_wan_does_not_leak_runtime_into_later_bypassed_calls() -> None:
+    model = DummyModel()
+    patched = WanSpectrumPatcher.patch(model, _cfg())
+    inner = patched.model.diffusion_model
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
+
+    first_out = inner.forward_orig(
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([sample_sigmas[0]], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        transformer_options={
+            _RUNTIME_KEY: runtime,
+            "sample_sigmas": sample_sigmas,
+            "cond_or_uncond": [0, 1],
+        },
+    )
+
+    bypass_out = model.model.diffusion_model.forward_orig(
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([sample_sigmas[1]], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        transformer_options={"sample_sigmas": sample_sigmas, "cond_or_uncond": [0, 1]},
+    )
+
+    assert torch.is_tensor(first_out)
+    assert bypass_out == "orig"
+    assert inner.original_calls == 1
 
 
 class DummyInnerWithForward(DummyInner):
@@ -231,7 +266,11 @@ def test_patcher_wraps__forward_as_runtime_passthrough_when_available() -> None:
     inner = patched.model.diffusion_model
 
     sample_sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
-    transformer_options = {"sample_sigmas": sample_sigmas, "cond_or_uncond": [0, 1]}
+    transformer_options = {
+        _RUNTIME_KEY: patched.model_options["transformer_options"][_RUNTIME_KEY],
+        "sample_sigmas": sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
     time_dim_concat = torch.ones((1, 1, 1), dtype=torch.float32)
     out = inner._forward(
         torch.ones((1, 1, 2, 2), dtype=torch.float32),
@@ -246,7 +285,7 @@ def test_patcher_wraps__forward_as_runtime_passthrough_when_available() -> None:
     assert inner.original_calls == 0
     assert inner.seen_time_dim_concat is time_dim_concat
     assert inner.seen_transformer_options is transformer_options
-    assert inner.seen_transformer_options[_RUNTIME_KEY] is inner._spectrum_wan_runtime
+    assert inner.seen_transformer_options[_RUNTIME_KEY] is patched.model_options["transformer_options"][_RUNTIME_KEY]
     assert inner._spectrum_wan__forward_wrapped is True
     assert inner._spectrum_wan_wrapped_attr == "forward_orig"
     assert inner._spectrum_wan_runtime.last_info["hook_target"] == "model.diffusion_model.forward_orig"
@@ -457,12 +496,13 @@ def test_locate_prefers_full_wan_descendant_over_forward_orig_only_proxy() -> No
 def test_forward_orig_wrapper_falls_back_and_logs_when_runtime_attrs_are_missing(capsys) -> None:
     patched = WanSpectrumPatcher.patch(DummyModelForwardOrigOnly(), _cfg())
     inner = patched.model.diffusion_model
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
 
     out = inner.forward_orig(
         torch.tensor([1.0]),
         torch.tensor([1.0]),
         torch.tensor([1.0]),
-        transformer_options={},
+        transformer_options={_RUNTIME_KEY: runtime},
     )
     captured = capsys.readouterr()
 
@@ -522,7 +562,7 @@ def test_successful_rebind_clears_stale_live_inner_root_type() -> None:
     assert "live_inner_root_type" not in runtime.last_info
 
 
-def test_patcher__forward_passthrough_overwrites_stale_runtime() -> None:
+def test_patcher__forward_passthrough_preserves_current_transformer_runtime() -> None:
     patched = WanSpectrumPatcher.patch(DummyModelWithForward(), _cfg())
     inner = patched.model.diffusion_model
 
@@ -542,7 +582,32 @@ def test_patcher__forward_passthrough_overwrites_stale_runtime() -> None:
     )
 
     assert inner.seen_transformer_options is transformer_options
-    assert inner.seen_transformer_options[_RUNTIME_KEY] is inner._spectrum_wan_runtime
+    assert inner.seen_transformer_options[_RUNTIME_KEY] is stale_runtime
+
+
+def test_patcher_apply_model_overwrites_stale_runtime_with_current_outer_runtime() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModelWithForward(), _cfg())
+    current_runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+    inner = patched.model.diffusion_model
+
+    stale_runtime = SpectrumWanRuntime(_cfg(), resolve_handler("auto", DummyModel()))
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
+    transformer_options = {
+        _RUNTIME_KEY: stale_runtime,
+        "sample_sigmas": sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
+
+    out = patched.model.apply_model(
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([sample_sigmas[0]], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        transformer_options=transformer_options,
+    )
+
+    assert out == "live"
+    assert inner.seen_transformer_options is transformer_options
+    assert inner.seen_transformer_options[_RUNTIME_KEY] is current_runtime
     assert inner.seen_transformer_options[_RUNTIME_KEY] is not stale_runtime
 
 
