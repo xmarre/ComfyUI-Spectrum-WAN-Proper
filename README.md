@@ -67,6 +67,9 @@ No additional dependencies are required beyond normal ComfyUI requirements.
   - `wan22_ti2v_5b`
   - `wan22_high_noise`
   - `wan22_low_noise`
+- `transition_mode` — expert transition behavior
+  - `separate_fit` — default behavior; each model/expert fits and forecasts independently
+  - `bias_shift` — experimental Wan 2.2 high-noise → low-noise handoff for expert workflows
 - `enabled` — enable/disable Spectrum patching
 - `blend_weight` — `w` in the official implementation; blend between local linear extrapolation and Chebyshev prediction
 - `degree` — Chebyshev polynomial degree `M`
@@ -93,6 +96,7 @@ window_size = 2.0
 flex_window = 0.75
 warmup_steps = 5
 history_size = 16
+transition_mode = separate_fit
 ```
 
 ### Why `history_size = 16` instead of 100?
@@ -109,7 +113,7 @@ Place the node directly after the WAN diffusion model loader:
 
 ```text
 Load Diffusion Model (Wan 2.1)
-  -> Spectrum Apply WAN (backend = wan21)
+  -> Spectrum Apply WAN (backend = wan21, transition_mode = separate_fit)
   -> sampler
 ```
 
@@ -117,7 +121,7 @@ Load Diffusion Model (Wan 2.1)
 
 ```text
 Load Diffusion Model (Wan 2.2 TI2V 5B)
-  -> Spectrum Apply WAN (backend = wan22_ti2v_5b)
+  -> Spectrum Apply WAN (backend = wan22_ti2v_5b, transition_mode = separate_fit)
   -> sampler
 ```
 
@@ -127,13 +131,28 @@ Apply the node **separately to each expert**:
 
 ```text
 Load Diffusion Model (Wan 2.2 high-noise 14B)
-  -> Spectrum Apply WAN (backend = wan22_high_noise)
+  -> Spectrum Apply WAN (backend = wan22_high_noise, transition_mode = separate_fit or bias_shift)
 
 Load Diffusion Model (Wan 2.2 low-noise 14B)
-  -> Spectrum Apply WAN (backend = wan22_low_noise)
+  -> Spectrum Apply WAN (backend = wan22_low_noise, transition_mode = separate_fit or bias_shift)
 ```
 
 Use those patched models in place of the original high-noise / low-noise expert models inside the existing ComfyUI Wan 2.2 workflow.
+
+## Transition modes
+
+`Spectrum Apply WAN` supports two expert-transition modes:
+
+- `separate_fit` keeps the default per-expert reset / re-fit behavior.
+- `bias_shift` is an experimental Wan 2.2 high-noise to low-noise handoff that forces the first low-noise step actual, computes a 1-step bias correction, refreshes that bias on later actual low-noise refresh steps, and uses the transferred high-noise predictor on forecast-eligible low-noise steps.
+
+For Wan 2.2 expert workflows, set `transition_mode = bias_shift` on both expert nodes if you want the experimental handoff. The high-noise expert publishes the transfer state and the low-noise expert consumes it. If the handoff is missing or incompatible, the low-noise expert falls back to the normal per-expert fit path.
+
+`bias_shift` is only intended for the Wan 2.2 expert pair (`wan22_high_noise` and `wan22_low_noise`). In practice, use `separate_fit` for Wan 2.1 and Wan 2.2 TI2V 5B.
+
+`Spectrum Apply WAN` uses current-call runtime injection through the patched outer model, so later bypassed/original-model calls with fresh `transformer_options` do not inherit Spectrum state from an earlier patched run.
+
+`spectrum_wan_run_token` must stay consistent across both phases, and `spectrum_wan_global_step_override` is only needed if the low phase is not contiguous from the published high-phase boundary.
 
 ## Implementation notes
 
@@ -151,6 +170,12 @@ The patch keeps ComfyUI’s existing WAN features intact:
 - I2V image context handling
 - reference latent path via `ref_conv`
 - normal WAN head and unpatchify behavior
+
+### Runtime scoping
+
+Runtime activation is resolved from the **current call's** `transformer_options`, with the patched outer `apply_model(...)` path injecting the active Spectrum runtime for that execution.
+
+That keeps Spectrum tied to the currently patched model call instead of reusing sticky inner-model state across later fresh or bypassed calls.
 
 ### Schedule tracking
 
@@ -209,32 +234,34 @@ ComfyUI-Spectrum-WAN-Proper/
 ├── comfyui_spectrum_wan/
 │   ├── __init__.py
 │   ├── config.py
-│   ├── handlers.py
 │   ├── forecast.py
+│   ├── handlers.py
 │   ├── runtime.py
 │   └── wan.py
 └── tests/
-    └── smoke_runtime.py
+    ├── smoke_runtime.py
+    ├── test_runtime_debug_logging.py
+    ├── test_smoke_bias_shift_transition.py
+    └── test_wan_runtime_resolution.py
 ```
 
-## Transition modes
+## Tests
 
-`Spectrum Apply WAN` supports two expert-transition modes:
+Lightweight non-ComfyUI tests are included.
 
-- `separate_fit` keeps the default per-expert reset / re-fit behavior.
-- `bias_shift` is an experimental Wan 2.2 high-noise to low-noise handoff that forces the first low-noise step actual, computes a 1-step bias correction, refreshes that bias on later actual low-noise refresh steps, and uses the transferred high-noise predictor on forecast-eligible low-noise steps.
-
-For Wan 2.2 expert workflows, set `transition_mode = bias_shift` on both expert nodes if you want the experimental handoff. The high-noise expert publishes the transfer state and the low-noise expert consumes it. If the handoff is missing or incompatible, the low-noise expert falls back to the normal per-expert fit path. `spectrum_wan_run_token` must stay consistent across both phases, and `spectrum_wan_global_step_override` is only needed if the low phase is not contiguous from the published high-phase boundary.
-
-## Smoke test
-
-A lightweight non-ComfyUI test is included:
+Smoke test:
 
 ```bash
 PYTHONPATH=. python tests/smoke_runtime.py
 ```
 
-Expected output:
+Full local test suite:
+
+```bash
+PYTHONPATH=. pytest -q
+```
+
+Expected smoke-test output:
 
 ```text
 ok
