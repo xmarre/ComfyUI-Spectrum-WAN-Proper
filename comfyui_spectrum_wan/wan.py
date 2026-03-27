@@ -254,8 +254,13 @@ def _run_spectrum_forward(
         head_emb = temb
         context_img_len = clip_fea.shape[-2] if clip_fea is not None else None
     else:
-        head_emb = inner.time_embedding(_sinusoidal_embedding_1d(inner.freq_dim, t).to(dtype=x.dtype, device=t.device))
-        timestep_proj = inner.time_projection(head_emb).unflatten(1, (6, -1))
+        timestep_shape = t.shape
+        head_emb = inner.time_embedding(
+            _sinusoidal_embedding_1d(inner.freq_dim, t.reshape(-1)).to(dtype=x[0].dtype, device=t.device)
+        )
+        head_emb = head_emb.reshape(*timestep_shape, head_emb.shape[-1])
+        time_proj = inner.time_projection(head_emb)
+        timestep_proj = time_proj.unflatten(time_proj.ndim - 1, (6, -1))
         encoder_hidden_states = inner.text_embedding(context)
         encoder_hidden_states_image = None
 

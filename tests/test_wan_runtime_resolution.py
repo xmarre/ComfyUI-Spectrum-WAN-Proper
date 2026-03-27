@@ -53,10 +53,10 @@ class NewApiInner(DummyInner):
         self.img_emb = None
 
     def time_embedding(self, x):
-        return torch.zeros((x.shape[0], 1), dtype=x.dtype, device=x.device)
+        return torch.zeros((*x.shape[:-1], 1), dtype=x.dtype, device=x.device)
 
     def time_projection(self, e):
-        return torch.zeros((e.shape[0], 6), dtype=e.dtype, device=e.device)
+        return torch.zeros((*e.shape[:-1], 6), dtype=e.dtype, device=e.device)
 
     def text_embedding(self, context):
         return context
@@ -378,6 +378,63 @@ def test_locate_prefers_full_new_api_wan_descendant_over_forward_orig_only_proxy
     assert live_inner.original_calls == 0
     assert patched.model._spectrum_wan_bound_inner_id == id(live_inner)
     assert runtime.last_info["live_inner_type"] == "NewApiInner"
+
+
+def test_run_spectrum_forward_new_api_preserves_multitoken_timestep_shape() -> None:
+    class CaptureBlock:
+        def __init__(self) -> None:
+            self.seen_e_shape = None
+
+        def __call__(
+            self,
+            x,
+            e,
+            freqs=None,
+            context=None,
+            context_img_len=None,
+            transformer_options=None,
+        ):
+            self.seen_e_shape = tuple(e.shape)
+            return x
+
+    class RuntimeStub:
+        def __init__(self) -> None:
+            self.last_info = {}
+
+        def begin_step(self, transformer_options, timesteps):
+            return {"step_idx": 0, "actual_forward": True, "global_step": 0}
+
+        def can_forecast(self, transformer_options):
+            raise AssertionError("can_forecast should not run when actual_forward is True")
+
+        def _debug_log(self, message: str) -> None:
+            pass
+
+        def observe_feature(self, transformer_options, step_idx, feature, global_step=None):
+            pass
+
+    inner = NewApiInner()
+    block = CaptureBlock()
+    inner.blocks = [block]
+    runtime = RuntimeStub()
+
+    original = wan._upstream_sinusoidal_embedding_1d
+    wan._upstream_sinusoidal_embedding_1d = (
+        lambda dim, t: torch.zeros((t.shape[0], dim), dtype=torch.float32, device=t.device)
+    )
+    try:
+        _run_spectrum_forward(
+            inner,
+            runtime,
+            torch.ones((1, 1, 2, 2), dtype=torch.float32),
+            torch.tensor([[1.0, 0.5]], dtype=torch.float32),
+            torch.zeros((1, 1, 1), dtype=torch.float32),
+            transformer_options={},
+        )
+    finally:
+        wan._upstream_sinusoidal_embedding_1d = original
+
+    assert block.seen_e_shape == (1, 2, 6, 1)
 
 
 def test_locate_prefers_full_wan_descendant_over_forward_orig_only_proxy() -> None:
