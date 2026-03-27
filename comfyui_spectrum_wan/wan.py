@@ -40,16 +40,32 @@ def _iter_wrapper_children(obj: Any):
             yield attr, child
 
 
+def _has_bindable_forward_orig(inner: Any) -> bool:
+    return callable(getattr(inner, "forward_orig", None))
+
+
+def _spectrum_runtime_missing_attrs(inner: Any) -> Tuple[str, ...]:
+    required = (
+        "blocks",
+        "head",
+        "patch_embedding",
+        "condition_embedder",
+        "unpatchify",
+    )
+    return tuple(name for name in required if not hasattr(inner, name))
+
+
 def _bind_runtime_to_inner(
     inner: Any,
     runtime: SpectrumWanRuntime,
     inner_name: Optional[str] = None,
 ) -> bool:
-    if inner is None or not _looks_like_wan(inner):
+    if inner is None or not _has_bindable_forward_orig(inner):
         return False
 
     inner._spectrum_wan_runtime = runtime
-    if hasattr(inner, "_forward") and callable(getattr(inner, "_forward")):
+    missing = _spectrum_runtime_missing_attrs(inner)
+    if not missing and hasattr(inner, "_forward") and callable(getattr(inner, "_forward")):
         _wrap_wan__forward_passthrough(inner)
     _wrap_wan_forward_orig(inner)
 
@@ -57,6 +73,7 @@ def _bind_runtime_to_inner(
     runtime.last_info["hook_target"] = f"{inner_name}.forward_orig" if inner_name else "forward_orig"
     runtime.last_info["live_inner_type"] = type(inner).__name__
     runtime.last_info["live_inner_id"] = id(inner)
+    runtime.last_info["runtime_missing_attrs"] = list(missing)
     runtime.last_info.pop("live_inner_root_type", None)
     return True
 
@@ -95,6 +112,7 @@ def _wrap_outer_apply_model(outer: Any, runtime: SpectrumWanRuntime) -> None:
                 current_runtime.last_info["live_inner_root_type"] = (
                     type(current_root).__name__ if current_root is not None else None
                 )
+                current_runtime.last_info.pop("runtime_missing_attrs", None)
                 current_runtime.last_info.pop("live_inner_type", None)
                 current_runtime.last_info.pop("live_inner_id", None)
                 current_runtime._debug_log(
@@ -109,15 +127,7 @@ def _wrap_outer_apply_model(outer: Any, runtime: SpectrumWanRuntime) -> None:
 
 
 def _looks_like_wan(inner: Any) -> bool:
-    required = (
-        "forward_orig",
-        "blocks",
-        "head",
-        "patch_embedding",
-        "condition_embedder",
-        "unpatchify",
-    )
-    return all(hasattr(inner, name) for name in required)
+    return _has_bindable_forward_orig(inner) and not _spectrum_runtime_missing_attrs(inner)
 
 
 def _locate_wan_like_descendant(root: Any, root_name: str) -> Tuple[Optional[Any], Optional[str]]:
@@ -126,6 +136,7 @@ def _locate_wan_like_descendant(root: Any, root_name: str) -> Tuple[Optional[Any
 
     queue = [(root, root_name)]
     seen = set()
+    fallback = None
 
     while queue:
         obj, name = queue.pop(0)
@@ -136,10 +147,14 @@ def _locate_wan_like_descendant(root: Any, root_name: str) -> Tuple[Optional[Any
 
         if _looks_like_wan(obj):
             return obj, name
+        if fallback is None and _has_bindable_forward_orig(obj):
+            fallback = (obj, name)
 
         for attr, child in _iter_wrapper_children(obj):
             queue.append((child, f"{name}.{attr}"))
 
+    if fallback is not None:
+        return fallback
     return None, root_name
 
 
@@ -299,6 +314,26 @@ def _wrap_wan_forward_orig(inner: Any) -> None:
     ):
         runtime = _resolve_runtime(transformer_options, inner)
         if runtime is None or not runtime.cfg.enabled:
+            if transformer_options is None:
+                return original_forward_orig(x, t, context, clip_fea=clip_fea, freqs=freqs, **kwargs)
+            return original_forward_orig(
+                x,
+                t,
+                context,
+                clip_fea=clip_fea,
+                freqs=freqs,
+                transformer_options=transformer_options,
+                **kwargs,
+            )
+
+        missing = _spectrum_runtime_missing_attrs(inner)
+        if missing:
+            runtime.last_info["runtime_missing_attrs"] = list(missing)
+            runtime._debug_log(
+                "[Spectrum WAN] runtime path unavailable "
+                f"inner_type={type(inner).__name__} "
+                f"missing_attrs={','.join(missing)}"
+            )
             if transformer_options is None:
                 return original_forward_orig(x, t, context, clip_fea=clip_fea, freqs=freqs, **kwargs)
             return original_forward_orig(

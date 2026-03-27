@@ -91,6 +91,23 @@ class NonWanInner:
     pass
 
 
+class ForwardOrigOnlyInner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def forward_orig(self, *args, **kwargs):
+        self.calls += 1
+        return "orig-only"
+
+
+class ForwardOrigProxyWrapper:
+    def __init__(self, inner) -> None:
+        self.model = inner
+
+    def forward_orig(self, *args, **kwargs):
+        return self.model.forward_orig(*args, **kwargs)
+
+
 class DummyInnerWrapper:
     def __init__(self, inner) -> None:
         self.model = inner
@@ -119,6 +136,12 @@ class DummyModel:
 
     def clone(self):
         return self
+
+
+class DummyModelForwardOrigOnly(DummyModel):
+    def __init__(self) -> None:
+        self.model = DummyOuter(ForwardOrigOnlyInner())
+        self.model_options = None
 
 
 def _cfg() -> SpectrumWanConfig:
@@ -277,6 +300,50 @@ def test_patcher_rebinds_runtime_when_live_inner_is_wrapped_one_level_deeper() -
     assert patched.model._spectrum_wan_bound_inner_id == id(live_inner)
     assert runtime.last_info["live_inner_type"] == "DummyInner"
     assert runtime.last_info["hook_target"] == "model.diffusion_model.model.forward_orig"
+
+
+def test_patcher_binds_live_inner_when_forward_orig_exists_even_if_runtime_attrs_are_missing() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModelForwardOrigOnly(), _cfg())
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+
+    inner = patched.model.diffusion_model
+    assert inner._spectrum_wan_runtime is runtime
+    assert runtime.last_info["patched"] is True
+    assert runtime.last_info["hook_target"] == "model.diffusion_model.forward_orig"
+    assert "blocks" in runtime.last_info["runtime_missing_attrs"]
+
+
+def test_locate_prefers_full_wan_descendant_over_forward_orig_only_proxy() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModel(), _cfg())
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+
+    live_inner = DummyInner()
+    patched.model.diffusion_model = ForwardOrigProxyWrapper(live_inner)
+    patched.model.apply_model(
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        transformer_options={"sample_sigmas": torch.tensor([1.0, 0.5, 0.0]), "cond_or_uncond": [0, 1]},
+    )
+
+    assert patched.model._spectrum_wan_bound_inner_id == id(live_inner)
+    assert runtime.last_info["live_inner_type"] == "DummyInner"
+
+
+def test_forward_orig_wrapper_falls_back_and_logs_when_runtime_attrs_are_missing(capsys) -> None:
+    patched = WanSpectrumPatcher.patch(DummyModelForwardOrigOnly(), _cfg())
+    inner = patched.model.diffusion_model
+
+    out = inner.forward_orig(
+        torch.tensor([1.0]),
+        torch.tensor([1.0]),
+        torch.tensor([1.0]),
+        transformer_options={},
+    )
+    captured = capsys.readouterr()
+
+    assert out == "orig-only"
+    assert "runtime path unavailable" in captured.err
 
 
 def test_patcher_clears_live_binding_state_when_current_inner_is_not_wan_like() -> None:
