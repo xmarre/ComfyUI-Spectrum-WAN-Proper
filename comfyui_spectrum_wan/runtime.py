@@ -227,10 +227,25 @@ class SpectrumWanRuntime:
                 handoff_key = (int(stream.run_token), key[1], _HIGH_TO_LOW_DIRECTION)
                 _TRANSITION_HANDOFFS.pop(handoff_key, None)
 
+    def _clear_transient_last_info(self) -> None:
+        transient_keys = (
+            "runtime_missing_attrs",
+            "forecast_error",
+            "schedule_signature_source",
+            "schedule_signature_len",
+            "schedule_signature_error",
+            "sigma_key_source",
+            "sigma_key_error",
+        )
+        for key in transient_keys:
+            self.last_info.pop(key, None)
+        self.last_info["last_sigma"] = None
+
     def reset_all(self) -> None:
         self._cleanup_transition_handoffs()
         for stream in self.streams.values():
             stream.reset()
+        self._clear_transient_last_info()
         self.last_info["run_id"] = self.run_id
         self.last_info["num_steps"] = self.last_info.get("num_steps", 0)
         self.last_info["handler"] = handler_metadata(self.handler)
@@ -244,6 +259,7 @@ class SpectrumWanRuntime:
         self.streams = {}
         self._last_schedule_signature = None
         self.run_id = 0
+        self._clear_transient_last_info()
         self.last_info.update(
             {
                 "enabled": self.cfg.enabled,
