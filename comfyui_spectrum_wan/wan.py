@@ -42,6 +42,67 @@ def _locate_inner_model(model: Any) -> Tuple[Optional[Any], Optional[str]]:
     return None, None
 
 
+def _bind_runtime_to_inner(
+    inner: Any,
+    runtime: SpectrumWanRuntime,
+    inner_name: Optional[str] = None,
+) -> bool:
+    if inner is None or not _looks_like_wan(inner):
+        return False
+
+    inner._spectrum_wan_runtime = runtime
+    if hasattr(inner, "_forward") and callable(getattr(inner, "_forward")):
+        _wrap_wan__forward_passthrough(inner)
+    _wrap_wan_forward_orig(inner)
+
+    runtime.last_info["patched"] = True
+    runtime.last_info["hook_target"] = f"{inner_name}.forward_orig" if inner_name else "forward_orig"
+    runtime.last_info["live_inner_type"] = type(inner).__name__
+    runtime.last_info["live_inner_id"] = id(inner)
+    return True
+
+
+def _wrap_outer_apply_model(outer: Any, runtime: SpectrumWanRuntime) -> None:
+    if outer is None or not hasattr(outer, "apply_model") or not callable(getattr(outer, "apply_model")):
+        return
+
+    outer._spectrum_wan_runtime = runtime
+
+    if getattr(outer, "_spectrum_wan_apply_model_wrapped", False):
+        return
+
+    original_apply_model = outer.apply_model
+
+    def wrapped_apply_model(*args, **kwargs):
+        current_runtime = getattr(outer, "_spectrum_wan_runtime", None)
+        if isinstance(current_runtime, SpectrumWanRuntime):
+            current_inner = getattr(outer, "diffusion_model", None)
+            previously_bound_id = getattr(outer, "_spectrum_wan_bound_inner_id", None)
+            bound = _bind_runtime_to_inner(current_inner, current_runtime, "model.diffusion_model")
+            current_inner_id = id(current_inner) if bound else None
+            outer._spectrum_wan_bound_inner_id = current_inner_id
+
+            if bound and previously_bound_id != current_inner_id:
+                current_runtime._debug_log(
+                    "[Spectrum WAN] rebound live inner "
+                    f"type={type(current_inner).__name__} "
+                    f"id={current_inner_id}"
+                )
+            elif not bound:
+                current_runtime.last_info["patched"] = False
+                current_runtime.last_info["hook_target"] = "model.diffusion_model"
+                current_runtime.last_info.pop("live_inner_type", None)
+                current_runtime.last_info.pop("live_inner_id", None)
+                current_runtime._debug_log(
+                    "[Spectrum WAN] live inner is not WAN-like; skipping runtime bind"
+                )
+
+        return original_apply_model(*args, **kwargs)
+
+    outer.apply_model = wrapped_apply_model
+    outer._spectrum_wan_apply_model_wrapped = True
+
+
 def _looks_like_wan(inner: Any) -> bool:
     required = (
         "forward_orig",
@@ -291,14 +352,11 @@ class WanSpectrumPatcher:
             "is_moe_expert": handler.is_moe_expert,
         }
 
+        outer = getattr(patched, "model", None)
+        _wrap_outer_apply_model(outer, runtime)
+
         inner, inner_name = _locate_inner_model(patched)
-        if inner is not None and _looks_like_wan(inner):
-            inner._spectrum_wan_runtime = runtime
-            if hasattr(inner, "_forward") and callable(getattr(inner, "_forward")):
-                _wrap_wan__forward_passthrough(inner)
-            _wrap_wan_forward_orig(inner)
-            runtime.last_info["hook_target"] = f"{inner_name}.forward_orig"
-            runtime.last_info["patched"] = True
+        if _bind_runtime_to_inner(inner, runtime, inner_name):
             if cfg.debug:
                 print(f"[Spectrum WAN] patched hook_target={runtime.last_info['hook_target']}", file=sys.stderr, flush=True)
         else:
