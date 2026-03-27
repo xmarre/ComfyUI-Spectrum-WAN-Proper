@@ -6,6 +6,14 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+try:
+    from comfy.ldm.wan.model import sinusoidal_embedding_1d as _upstream_sinusoidal_embedding_1d
+except ModuleNotFoundError as exc:  # pragma: no cover - ComfyUI is not available in unit tests.
+    if exc.name and exc.name.startswith("comfy"):
+        _upstream_sinusoidal_embedding_1d = None
+    else:
+        raise
+
 from .config import SpectrumWanConfig
 from .handlers import resolve_handler
 from .runtime import SpectrumWanRuntime
@@ -44,15 +52,49 @@ def _has_bindable_forward_orig(inner: Any) -> bool:
     return callable(getattr(inner, "forward_orig", None))
 
 
+def _has_legacy_conditioning(inner: Any) -> bool:
+    return callable(getattr(inner, "condition_embedder", None))
+
+
+def _has_split_conditioning(inner: Any) -> bool:
+    return (
+        hasattr(inner, "freq_dim")
+        and
+        callable(getattr(inner, "time_embedding", None))
+        and callable(getattr(inner, "time_projection", None))
+        and callable(getattr(inner, "text_embedding", None))
+    )
+
+
+def _sinusoidal_embedding_1d(dim: int, timesteps):
+    func = _upstream_sinusoidal_embedding_1d
+    if func is None:
+        try:
+            from comfy.ldm.wan.model import sinusoidal_embedding_1d as func
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("comfy"):
+                raise RuntimeError("comfy.ldm.wan.model is unavailable for sinusoidal embedding fallback") from exc
+            raise
+    return func(dim, timesteps)
+
+
 def _spectrum_runtime_missing_attrs(inner: Any) -> Tuple[str, ...]:
-    required = (
+    base_required = (
         "blocks",
         "head",
         "patch_embedding",
-        "condition_embedder",
         "unpatchify",
     )
-    return tuple(name for name in required if not hasattr(inner, name))
+    missing = [name for name in base_required if not hasattr(inner, name)]
+    if not (_has_legacy_conditioning(inner) or _has_split_conditioning(inner)):
+        missing.extend(
+            [
+                "condition_embedder|time_embedding",
+                "condition_embedder|time_projection",
+                "condition_embedder|text_embedding",
+            ]
+        )
+    return tuple(missing)
 
 
 def _bind_runtime_to_inner(
@@ -206,14 +248,34 @@ def _run_spectrum_forward(
     grid_sizes = x.shape[2:]
     transformer_options["grid_sizes"] = grid_sizes
     x = x.flatten(2).transpose(1, 2)
+    context_img_len = None
 
-    temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = inner.condition_embedder(
-        t, context, clip_fea
-    )
-    timestep_proj = timestep_proj.unflatten(1, (6, -1))
+    if _has_legacy_conditioning(inner):
+        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = inner.condition_embedder(
+            t, context, clip_fea
+        )
+        timestep_proj = timestep_proj.unflatten(1, (6, -1))
 
-    if encoder_hidden_states_image is not None:
-        encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+        if encoder_hidden_states_image is not None:
+            encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+
+        head_emb = temb
+        context_img_len = clip_fea.shape[-2] if clip_fea is not None else None
+    else:
+        timestep_shape = t.shape
+        head_emb = inner.time_embedding(
+            _sinusoidal_embedding_1d(inner.freq_dim, t.reshape(-1)).to(dtype=x[0].dtype, device=t.device)
+        )
+        head_emb = head_emb.reshape(*timestep_shape, head_emb.shape[-1])
+        time_proj = inner.time_projection(head_emb)
+        timestep_proj = time_proj.unflatten(time_proj.ndim - 1, (6, -1))
+        encoder_hidden_states = inner.text_embedding(context)
+        encoder_hidden_states_image = None
+
+        if clip_fea is not None and callable(getattr(inner, "img_emb", None)):
+            encoder_hidden_states_image = inner.img_emb(clip_fea)
+            encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+            context_img_len = encoder_hidden_states_image.shape[1]
 
     full_ref = None
     if getattr(inner, "ref_conv", None) is not None:
@@ -243,7 +305,7 @@ def _run_spectrum_forward(
             predicted_x = predicted_x.to(device=x.device, dtype=x.dtype)
             if torch.isfinite(predicted_x).all():
                 x = predicted_x
-                x = inner.head(x, temb)
+                x = inner.head(x, head_emb)
                 if full_ref is not None:
                     x = x[:, full_ref.shape[1]:]
                 return inner.unpatchify(x, grid_sizes)
@@ -252,7 +314,6 @@ def _run_spectrum_forward(
     blocks_replace = patches_replace.get("dit", {})
     transformer_options["total_blocks"] = len(inner.blocks)
     transformer_options["block_type"] = "double"
-    context_img_len = clip_fea.shape[-2] if clip_fea is not None else None
 
     for i, block in enumerate(inner.blocks):
         transformer_options["block_index"] = i
@@ -291,7 +352,7 @@ def _run_spectrum_forward(
         global_step=decision.get("global_step"),
     )
 
-    x = inner.head(x, temb)
+    x = inner.head(x, head_emb)
     if full_ref is not None:
         x = x[:, full_ref.shape[1]:]
     return inner.unpatchify(x, grid_sizes)

@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 from comfyui_spectrum_wan.config import SpectrumWanConfig
 from comfyui_spectrum_wan.handlers import resolve_handler
 from comfyui_spectrum_wan.runtime import SpectrumWanRuntime
+import comfyui_spectrum_wan.wan as wan
 from comfyui_spectrum_wan.wan import _RUNTIME_KEY, _run_spectrum_forward, WanSpectrumPatcher
 
 
@@ -42,6 +43,23 @@ class DummyInner:
 
     def unpatchify(self, x, grid_sizes):
         return x
+
+
+class NewApiInner(DummyInner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.condition_embedder = None
+        self.freq_dim = 8
+        self.img_emb = None
+
+    def time_embedding(self, x):
+        return torch.zeros((*x.shape[:-1], 1), dtype=x.dtype, device=x.device)
+
+    def time_projection(self, e):
+        return torch.zeros((*e.shape[:-1], 6), dtype=e.dtype, device=e.device)
+
+    def text_embedding(self, context):
+        return context
 
 
 class DummyOuter:
@@ -88,6 +106,10 @@ class DummyOuter:
 
 
 class NonWanInner:
+    pass
+
+
+class LegacyOnlyInner(DummyInner):
     pass
 
 
@@ -311,6 +333,108 @@ def test_patcher_binds_live_inner_when_forward_orig_exists_even_if_runtime_attrs
     assert runtime.last_info["patched"] is True
     assert runtime.last_info["hook_target"] == "model.diffusion_model.forward_orig"
     assert "blocks" in runtime.last_info["runtime_missing_attrs"]
+
+
+def test_runtime_missing_attrs_accepts_legacy_conditioning_api() -> None:
+    inner = LegacyOnlyInner()
+
+    missing = wan._spectrum_runtime_missing_attrs(inner)
+
+    assert "condition_embedder|time_embedding" not in missing
+    assert "condition_embedder|time_projection" not in missing
+    assert "condition_embedder|text_embedding" not in missing
+
+
+def test_runtime_missing_attrs_accepts_new_conditioning_api() -> None:
+    inner = NewApiInner()
+
+    missing = wan._spectrum_runtime_missing_attrs(inner)
+
+    assert "condition_embedder|time_embedding" not in missing
+    assert "condition_embedder|time_projection" not in missing
+    assert "condition_embedder|text_embedding" not in missing
+
+
+def test_locate_prefers_full_new_api_wan_descendant_over_forward_orig_only_proxy() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModel(), _cfg())
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+
+    live_inner = NewApiInner()
+    patched.model.diffusion_model = ForwardOrigProxyWrapper(live_inner)
+    original = wan._upstream_sinusoidal_embedding_1d
+    wan._upstream_sinusoidal_embedding_1d = (
+        lambda dim, t: torch.zeros((t.shape[0], dim), dtype=torch.float32, device=t.device)
+    )
+    try:
+        patched.model.apply_model(
+            torch.ones((1, 1, 2, 2), dtype=torch.float32),
+            torch.tensor([1.0], dtype=torch.float32),
+            torch.zeros((1, 1, 1), dtype=torch.float32),
+            transformer_options={"sample_sigmas": torch.tensor([1.0, 0.5, 0.0]), "cond_or_uncond": [0, 1]},
+        )
+    finally:
+        wan._upstream_sinusoidal_embedding_1d = original
+
+    assert live_inner.original_calls == 0
+    assert patched.model._spectrum_wan_bound_inner_id == id(live_inner)
+    assert runtime.last_info["live_inner_type"] == "NewApiInner"
+
+
+def test_run_spectrum_forward_new_api_preserves_multitoken_timestep_shape() -> None:
+    class CaptureBlock:
+        def __init__(self) -> None:
+            self.seen_e_shape = None
+
+        def __call__(
+            self,
+            x,
+            e,
+            freqs=None,
+            context=None,
+            context_img_len=None,
+            transformer_options=None,
+        ):
+            self.seen_e_shape = tuple(e.shape)
+            return x
+
+    class RuntimeStub:
+        def __init__(self) -> None:
+            self.last_info = {}
+
+        def begin_step(self, transformer_options, timesteps):
+            return {"step_idx": 0, "actual_forward": True, "global_step": 0}
+
+        def can_forecast(self, transformer_options):
+            raise AssertionError("can_forecast should not run when actual_forward is True")
+
+        def _debug_log(self, message: str) -> None:
+            pass
+
+        def observe_feature(self, transformer_options, step_idx, feature, global_step=None):
+            pass
+
+    inner = NewApiInner()
+    block = CaptureBlock()
+    inner.blocks = [block]
+    runtime = RuntimeStub()
+
+    original = wan._upstream_sinusoidal_embedding_1d
+    wan._upstream_sinusoidal_embedding_1d = (
+        lambda dim, t: torch.zeros((t.shape[0], dim), dtype=torch.float32, device=t.device)
+    )
+    try:
+        _run_spectrum_forward(
+            inner,
+            runtime,
+            torch.ones((1, 1, 2, 2), dtype=torch.float32),
+            torch.tensor([[1.0, 0.5]], dtype=torch.float32),
+            torch.zeros((1, 1, 1), dtype=torch.float32),
+            transformer_options={},
+        )
+    finally:
+        wan._upstream_sinusoidal_embedding_1d = original
+
+    assert block.seen_e_shape == (1, 2, 6, 1)
 
 
 def test_locate_prefers_full_wan_descendant_over_forward_orig_only_proxy() -> None:
