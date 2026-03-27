@@ -8,8 +8,11 @@ import torch
 
 try:
     from comfy.ldm.wan.model import sinusoidal_embedding_1d as _upstream_sinusoidal_embedding_1d
-except Exception:  # pragma: no cover - ComfyUI is not available in unit tests.
-    _upstream_sinusoidal_embedding_1d = None
+except ModuleNotFoundError as exc:  # pragma: no cover - ComfyUI is not available in unit tests.
+    if exc.name and exc.name.startswith("comfy"):
+        _upstream_sinusoidal_embedding_1d = None
+    else:
+        raise
 
 from .config import SpectrumWanConfig
 from .handlers import resolve_handler
@@ -66,7 +69,12 @@ def _has_split_conditioning(inner: Any) -> bool:
 def _sinusoidal_embedding_1d(dim: int, timesteps):
     func = _upstream_sinusoidal_embedding_1d
     if func is None:
-        from comfy.ldm.wan.model import sinusoidal_embedding_1d as func
+        try:
+            from comfy.ldm.wan.model import sinusoidal_embedding_1d as func
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("comfy"):
+                raise RuntimeError("comfy.ldm.wan.model is unavailable for sinusoidal embedding fallback") from exc
+            raise
     return func(dim, timesteps)
 
 
