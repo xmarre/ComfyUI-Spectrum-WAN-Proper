@@ -36,6 +36,13 @@ class SpectrumApplyWAN:
                 "warmup_steps": ("INT", {"default": 5, "min": 0, "max": 64, "step": 1}),
                 "history_size": ("INT", {"default": 16, "min": 2, "max": 128, "step": 1}),
                 "debug": ("BOOLEAN", {"default": False}),
+                "forecaster_cache_mode": (
+                    [
+                        "legacy_dense_coeff",
+                        "low_vram_exact",
+                    ],
+                    {"default": "legacy_dense_coeff"},
+                ),
             }
         }
 
@@ -58,6 +65,7 @@ class SpectrumApplyWAN:
         warmup_steps,
         history_size,
         debug,
+        forecaster_cache_mode,
     ):
         if not enabled:
             return (model,)
@@ -74,6 +82,7 @@ class SpectrumApplyWAN:
             warmup_steps=warmup_steps,
             history_size=history_size,
             debug=debug,
+            forecaster_cache_mode=forecaster_cache_mode,
         ).validated()
         return (WanSpectrumPatcher.patch(model, cfg),)
 

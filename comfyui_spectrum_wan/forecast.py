@@ -8,7 +8,8 @@ import torch
 
 @dataclass
 class _FitCache:
-    coeff: torch.Tensor
+    coeff: Optional[torch.Tensor]
+    solve_xt: Optional[torch.Tensor]
     feature_shape: torch.Size
     feature_dtype: torch.dtype
     total_steps: int
@@ -18,9 +19,11 @@ class ChebyshevFeatureForecaster:
     """
     Online Spectrum-style forecaster for WAN hidden features.
 
-    This implementation is intentionally chunked over feature dimension so that
-    it avoids the large transient float32 allocations that a naive `(K, F)`
-    materialization would create for video models.
+    The default cache mode preserves the original dense coefficient path.
+    An optional exact low-VRAM mode avoids materializing the dense
+    `(degree + 1, flat_feature_size)` coefficient tensor by caching only the
+    small solver state and applying equivalent history weights chunk-by-chunk
+    at prediction time.
     """
 
     def __init__(
@@ -30,12 +33,18 @@ class ChebyshevFeatureForecaster:
         blend_weight: float,
         history_size: int = 16,
         fit_chunk_size: int = 1_000_000,
+        forecaster_cache_mode: str = "legacy_dense_coeff",
     ):
         self.degree = int(degree)
         self.ridge_lambda = float(ridge_lambda)
         self.blend_weight = float(blend_weight)
         self.history_size = int(history_size)
         self.fit_chunk_size = int(fit_chunk_size)
+        self.forecaster_cache_mode = str(forecaster_cache_mode)
+        if self.forecaster_cache_mode not in {"legacy_dense_coeff", "low_vram_exact"}:
+            raise ValueError(
+                f"Unsupported forecaster_cache_mode '{self.forecaster_cache_mode}'."
+            )
         self.reset()
 
     def reset(self) -> None:
@@ -82,6 +91,12 @@ class ChebyshevFeatureForecaster:
             cols.append(2.0 * taus * cols[-1] - cols[-2])
         return torch.cat(cols[: degree + 1], dim=1)
 
+    def _history_chunk(self, start: int, end: int) -> torch.Tensor:
+        return torch.stack(
+            [feat.reshape(-1)[start:end].to(torch.float32) for _, feat in self.history],
+            dim=0,
+        )
+
     def _fit_if_needed(self, total_steps: int) -> None:
         if self._fit_cache is not None and self._fit_cache.total_steps == int(total_steps):
             return
@@ -106,22 +121,25 @@ class ChebyshevFeatureForecaster:
             jitter = max(jitter * 1e-6, 1e-6)
             chol = torch.linalg.cholesky(lhs + jitter * torch.eye(p, device=device, dtype=torch.float32))
 
-        flat_size = self._flat_feature_size
-        coeff = torch.empty((p, flat_size), device=device, dtype=self._feature_dtype)
         xt = x_mat.transpose(0, 1)
+        coeff: Optional[torch.Tensor] = None
+        solve_xt: Optional[torch.Tensor] = None
 
-        for start in range(0, flat_size, self.fit_chunk_size):
-            end = min(start + self.fit_chunk_size, flat_size)
-            h_chunk = torch.stack(
-                [feat.reshape(-1)[start:end].to(torch.float32) for _, feat in self.history],
-                dim=0,
-            )
-            xt_h_chunk = xt @ h_chunk
-            c_chunk = torch.cholesky_solve(xt_h_chunk, chol).to(self._feature_dtype)
-            coeff[:, start:end] = c_chunk
+        if self.forecaster_cache_mode == "legacy_dense_coeff":
+            flat_size = self._flat_feature_size
+            coeff = torch.empty((p, flat_size), device=device, dtype=self._feature_dtype)
+            for start in range(0, flat_size, self.fit_chunk_size):
+                end = min(start + self.fit_chunk_size, self._flat_feature_size)
+                h_chunk = self._history_chunk(start, end)
+                xt_h_chunk = xt @ h_chunk
+                c_chunk = torch.cholesky_solve(xt_h_chunk, chol).to(self._feature_dtype)
+                coeff[:, start:end] = c_chunk
+        else:
+            solve_xt = torch.cholesky_solve(xt, chol)
 
         self._fit_cache = _FitCache(
             coeff=coeff,
+            solve_xt=solve_xt,
             feature_shape=self._feature_shape,
             feature_dtype=self._feature_dtype,
             total_steps=int(total_steps),
@@ -129,16 +147,36 @@ class ChebyshevFeatureForecaster:
 
     def _predict_chebyshev_flat(self, step_idx: int, total_steps: int) -> torch.Tensor:
         assert self._fit_cache is not None
+        coeff = self._fit_cache.coeff
+        solve_xt = self._fit_cache.solve_xt
+        if coeff is not None:
+            cache_device = coeff.device
+        else:
+            assert solve_xt is not None
+            cache_device = solve_xt.device
         tau_star = self._tau(
-            torch.tensor([int(step_idx)], device=self._fit_cache.coeff.device, dtype=torch.float32),
+            torch.tensor([int(step_idx)], device=cache_device, dtype=torch.float32),
             total_steps,
         )
         x_star = self._design(tau_star, self.degree)
-        flat_size = self._fit_cache.coeff.shape[1]
-        out = torch.empty((flat_size,), device=self._fit_cache.coeff.device, dtype=self._fit_cache.feature_dtype)
+
+        if coeff is not None:
+            flat_size = coeff.shape[1]
+            out = torch.empty((flat_size,), device=coeff.device, dtype=self._fit_cache.feature_dtype)
+            for start in range(0, flat_size, self.fit_chunk_size):
+                end = min(start + self.fit_chunk_size, flat_size)
+                pred_chunk = (x_star @ coeff[:, start:end].to(torch.float32)).reshape(-1)
+                out[start:end] = pred_chunk.to(self._fit_cache.feature_dtype)
+            return out
+
+        assert solve_xt is not None
+        weights = torch.matmul(x_star, solve_xt).reshape(-1)
+        flat_size = self._flat_feature_size
+        out = torch.empty((flat_size,), device=solve_xt.device, dtype=self._fit_cache.feature_dtype)
         for start in range(0, flat_size, self.fit_chunk_size):
             end = min(start + self.fit_chunk_size, flat_size)
-            pred_chunk = (x_star @ self._fit_cache.coeff[:, start:end].to(torch.float32)).reshape(-1)
+            h_chunk = self._history_chunk(start, end)
+            pred_chunk = torch.matmul(weights, h_chunk)
             out[start:end] = pred_chunk.to(self._fit_cache.feature_dtype)
         return out
 
