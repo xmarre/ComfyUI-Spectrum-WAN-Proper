@@ -44,6 +44,10 @@ This is deliberate. It avoids pretending the two experts share one stationary fe
 
 ## Installation
 
+Install via Comfyui-Manager
+
+or
+
 Clone or copy this repository into your ComfyUI `custom_nodes` directory:
 
 ```bash
