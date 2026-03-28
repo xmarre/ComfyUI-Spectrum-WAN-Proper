@@ -16,6 +16,11 @@ _VALID_TRANSITION_MODES = {
     "bias_shift",
 }
 
+_VALID_FORECASTER_CACHE_MODES = {
+    "legacy_dense_coeff",
+    "low_vram_exact",
+}
+
 _BIAS_SHIFT_BACKENDS = {
     "wan22_high_noise",
     "wan22_low_noise",
@@ -40,6 +45,7 @@ class SpectrumWanConfig:
     history_size: int = 16
     fit_chunk_size: int = 1_000_000
     debug: bool = False
+    forecaster_cache_mode: str = "legacy_dense_coeff"
 
     def validated(self) -> "SpectrumWanConfig":
         if self.backend not in _VALID_BACKENDS:
@@ -67,4 +73,8 @@ class SpectrumWanConfig:
             raise ValueError("history_size must be >= 2.")
         if int(self.fit_chunk_size) < 1:
             raise ValueError("fit_chunk_size must be >= 1.")
+        if self.forecaster_cache_mode not in _VALID_FORECASTER_CACHE_MODES:
+            raise ValueError(
+                f"Unsupported forecaster_cache_mode '{self.forecaster_cache_mode}'."
+            )
         return self

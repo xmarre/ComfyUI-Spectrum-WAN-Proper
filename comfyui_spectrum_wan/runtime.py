@@ -38,6 +38,7 @@ class _BiasShiftPredictor:
     blend_weight: float
     history_size: int
     fit_chunk_size: int
+    forecaster_cache_mode: str
     low_phase_offset: int
     total_steps_hint: int
     feature_shape: torch.Size
@@ -60,6 +61,7 @@ class _BiasShiftPredictor:
             blend_weight=cfg.blend_weight,
             history_size=cfg.history_size,
             fit_chunk_size=cfg.fit_chunk_size,
+            forecaster_cache_mode=cfg.forecaster_cache_mode,
             low_phase_offset=handoff.next_global_step,
             total_steps_hint=int(handoff.total_steps_hint),
             feature_shape=handoff.feature_shape,
@@ -76,6 +78,7 @@ class _BiasShiftPredictor:
             blend_weight=self.blend_weight,
             history_size=self.history_size,
             fit_chunk_size=self.fit_chunk_size,
+            forecaster_cache_mode=self.forecaster_cache_mode,
         )
         for global_step, feature in self.handoff_history:
             forecaster.update(global_step, feature.to(device=target_device, non_blocking=True))
@@ -167,6 +170,7 @@ class _StreamState:
             blend_weight=self.cfg.blend_weight,
             history_size=self.cfg.history_size,
             fit_chunk_size=self.cfg.fit_chunk_size,
+            forecaster_cache_mode=self.cfg.forecaster_cache_mode,
         )
 
     def reset(self) -> None:
