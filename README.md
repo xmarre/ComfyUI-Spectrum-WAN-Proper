@@ -7,7 +7,7 @@ Native ComfyUI custom node repo that ports [Spectrum](https://hanjq17.github.io/
 - **Wan 2.2 14B High-Noise expert**
 - **Wan 2.2 14B Low-Noise expert**
 
-This is intentionally one WAN-focused repository instead of a generic "video Spectrum for everything" package.
+This is intentionally one WAN-focused repository instead of a generic "Spectrum for everything" package.
 
 ## What this repo does
 
