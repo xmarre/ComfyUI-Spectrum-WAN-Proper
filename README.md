@@ -78,6 +78,9 @@ No additional dependencies are required beyond normal ComfyUI requirements.
 - `flex_window` — amount added to the window after each actual forward
 - `warmup_steps` — number of initial actual forwards
 - `history_size` — number of actual WAN features to retain for fitting
+- `forecaster_cache_mode` — Chebyshev cache implementation mode
+  - `legacy_dense_coeff` — default; preserves the original dense coefficient cache path
+  - `low_vram_exact` — opt-in exact low-VRAM mode; avoids the dense coefficient cache and applies equivalent history weights chunk-by-chunk at prediction time
 - `debug` — emit runtime step decisions to stderr
 
 **Output**
@@ -97,6 +100,7 @@ flex_window = 0.75
 warmup_steps = 5
 history_size = 16
 transition_mode = separate_fit
+forecaster_cache_mode = legacy_dense_coeff
 ```
 
 ### Why `history_size = 16` instead of 100?
@@ -104,6 +108,15 @@ transition_mode = separate_fit
 The official reference implementation uses a large history cap, but the recommended adaptive WAN settings in the paper consume only **14** or **10** actual network evaluations in the important regimes. A history cap of `16` therefore preserves all actual points in those standard settings while materially reducing memory pressure for WAN video features.
 
 That is an explicit practical approximation in this repo.
+
+### Forecaster cache modes
+
+`Spectrum Apply WAN` exposes two Chebyshev cache modes:
+
+- `legacy_dense_coeff` preserves the original implementation behavior and remains the default.
+- `low_vram_exact` is an opt-in exact mode that avoids materializing the dense `(degree + 1, flat_feature_size)` coefficient cache on the feature device.
+
+`low_vram_exact` keeps the same ridge/Chebyshev forecast formulation and is intended for workloads where the dense coefficient cache causes unnecessary VRAM pressure. It should preserve expected output quality, but it is not guaranteed to be bit-identical to `legacy_dense_coeff` because the two paths quantize intermediate values at different points.
 
 ## Usage
 
@@ -187,7 +200,9 @@ It also separates stream state by `cond_or_uncond` signature when ComfyUI provid
 
 WAN hidden features are very large. To keep the implementation practical, the ridge solve is implemented in **feature-dimension chunks**, which avoids the worst transient float32 allocations from a naive `(K, F)` full-matrix solve.
 
-The final coefficient tensor is still large, because that is intrinsic to Spectrum’s feature-level forecasting approach.
+In the default `legacy_dense_coeff` mode, the final dense coefficient tensor is still cached on the feature device to preserve the original fast prediction path.
+
+The optional `low_vram_exact` mode keeps the same ridge/Chebyshev formulation but avoids caching that dense coefficient tensor. Instead, it stores only the small solver state and applies the equivalent history weights chunk-by-chunk at prediction time. That materially reduces avoidable VRAM overhead while keeping the same forecasting mechanism.
 
 ## Assumptions, caveats, and limitations
 
@@ -209,7 +224,9 @@ Any custom node that depends on **executing internal WAN blocks on every step** 
 
 ### Memory pressure
 
-Even with final-block-only caching, WAN video features are large. `history_size`, frame count, resolution, and hidden width all affect VRAM pressure.
+Even with final-block-only caching, WAN video features are large. `history_size`, frame count, resolution, hidden width, and `forecaster_cache_mode` all affect VRAM pressure.
+
+`low_vram_exact` reduces the avoidable VRAM overhead from the dense Chebyshev coefficient cache, but it does **not** remove the core working-set cost of GPU-resident feature history and chunked prediction buffers.
 
 ### Practical approximation versus the paper
 
@@ -240,6 +257,7 @@ ComfyUI-Spectrum-WAN-Proper/
 │   └── wan.py
 └── tests/
     ├── smoke_runtime.py
+    ├── test_forecast.py
     ├── test_runtime_debug_logging.py
     ├── test_smoke_bias_shift_transition.py
     └── test_wan_runtime_resolution.py
@@ -247,7 +265,7 @@ ComfyUI-Spectrum-WAN-Proper/
 
 ## Tests
 
-Lightweight non-ComfyUI tests are included.
+Lightweight non-ComfyUI tests are included, including forecast-path parity coverage for the legacy dense coefficient mode and the opt-in exact low-VRAM mode.
 
 Smoke test:
 
