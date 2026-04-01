@@ -365,6 +365,32 @@ class SpectrumWanRuntime:
     def num_steps(self) -> int:
         return max(int(self.last_info.get("num_steps", 0)), 1)
 
+    def end_step(self, transformer_options: Dict[str, Any], step_idx: int) -> None:
+        if int(step_idx) + 1 < self.num_steps():
+            return
+
+        final_num_steps = self.num_steps()
+        key = self._stream_key(transformer_options)
+        stream = self.streams.get(key)
+        if stream is None:
+            return
+
+        # The final output for this stream has already been produced.
+        # At this point, run-scoped forecasting state should be released so
+        # downstream stages (e.g. VAE decode / cleanup nodes) do not inherit
+        # large retained tensors from the finished sampler.
+        stream.reset()
+
+        # Drop the stream object entirely so its forecaster/history tensors are
+        # not kept alive by the runtime mapping after the cycle is complete.
+        self.streams.pop(key, None)
+
+        self._clear_transient_last_info()
+        self.last_info["run_id"] = self.run_id
+        self.last_info["num_steps"] = final_num_steps
+        self.last_info["handler"] = handler_metadata(self.handler)
+        self.last_info["config"] = asdict(self.cfg)
+
     def sigma_key(self, transformer_options: Dict[str, Any], timesteps: torch.Tensor) -> float:
         sigmas = transformer_options.get("sigmas", None)
         self.last_info.pop("sigma_key_source", None)
