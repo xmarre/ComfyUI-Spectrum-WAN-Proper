@@ -4,7 +4,7 @@ from collections import OrderedDict
 import sys
 from dataclasses import asdict, dataclass, field
 from itertools import count
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -203,6 +203,7 @@ class SpectrumWanRuntime:
         self._last_schedule_signature = None
         self.streams: Dict[Tuple[str, Tuple[int, ...]], _StreamState] = {}
         self.run_id = 0
+        self._orphaned_handoff_keys: Set[Tuple[int, Tuple[int, ...], str]] = set()
         self.last_info = {
             "enabled": self.cfg.enabled,
             "patched": False,
@@ -226,6 +227,10 @@ class SpectrumWanRuntime:
         return _StreamState(self.cfg)
 
     def _cleanup_transition_handoffs(self) -> None:
+        for handoff_key in self._orphaned_handoff_keys:
+            _TRANSITION_HANDOFFS.pop(handoff_key, None)
+        self._orphaned_handoff_keys.clear()
+
         for key, stream in self.streams.items():
             if stream.run_token is not None:
                 handoff_key = (int(stream.run_token), key[1], _HIGH_TO_LOW_DIRECTION)
@@ -374,6 +379,9 @@ class SpectrumWanRuntime:
         stream = self.streams.get(key)
         if stream is None:
             return
+        if self._should_publish_bias_shift_handoff() and stream.run_token is not None:
+            handoff_key = (int(stream.run_token), key[1], _HIGH_TO_LOW_DIRECTION)
+            self._orphaned_handoff_keys.add(handoff_key)
 
         # The final output for this stream has already been produced.
         # At this point, run-scoped forecasting state should be released so
