@@ -310,7 +310,9 @@ def _run_spectrum_forward(
                 x = inner.head(x, head_emb)
                 if full_ref is not None:
                     x = x[:, full_ref.shape[1]:]
-                return inner.unpatchify(x, grid_sizes)
+                out = inner.unpatchify(x, grid_sizes)
+                runtime.end_step(transformer_options, step_idx)
+                return out
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -357,7 +359,9 @@ def _run_spectrum_forward(
     x = inner.head(x, head_emb)
     if full_ref is not None:
         x = x[:, full_ref.shape[1]:]
-    return inner.unpatchify(x, grid_sizes)
+    out = inner.unpatchify(x, grid_sizes)
+    runtime.end_step(transformer_options, step_idx)
+    return out
 
 
 def _wrap_wan_forward_orig(inner: Any) -> None:
