@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import torch
 
 from .config import SpectrumWanConfig, bias_shift_backend_supported
-from .forecast import ChebyshevFeatureForecaster
+from .forecast import ChebyshevFeatureForecaster, _disable_compile
 from .handlers import WanBackendHandler, handler_metadata
 
 _HIGH_TO_LOW_DIRECTION = "wan22_high_noise->wan22_low_noise"
@@ -509,6 +509,7 @@ class SpectrumWanRuntime:
             )
         return int(step_idx)
 
+    @_disable_compile
     def begin_step(self, transformer_options: Dict[str, Any], timesteps: torch.Tensor) -> Dict[str, Any]:
         self._ensure_run_sync(transformer_options)
         stream = self._stream(transformer_options)
