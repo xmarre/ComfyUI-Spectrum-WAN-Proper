@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import math
 import sys
 from dataclasses import asdict, dataclass, field
 from itertools import count
@@ -544,7 +545,10 @@ class SpectrumWanRuntime:
         transformer_options[_GLOBAL_STEP_KEY] = int(global_step)
 
         if step_idx >= self.cfg.warmup_steps:
-            actual_forward = ((stream.num_consecutive_cached_steps + 1) % max(1, int(torch.floor(torch.tensor(stream.curr_ws)).item()))) == 0
+            actual_forward = (
+                (stream.num_consecutive_cached_steps + 1)
+                % max(1, math.floor(stream.curr_ws))
+            ) == 0
 
         has_ready_transfer = stream.bias_shift_predictor is not None and stream.bias_shift_predictor.ready()
         if stream.bias_shift_predictor is not None and not stream.bias_shift_predictor.ready():
