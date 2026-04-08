@@ -11,7 +11,10 @@ _F = TypeVar("_F", bound=Callable[..., object])
 def _disable_compile(fn: _F) -> _F:
     compiler_disable = getattr(getattr(torch, "compiler", None), "disable", None)
     if compiler_disable is not None:
-        return compiler_disable(reason="Spectrum WAN forecaster should run eagerly")(fn)  # type: ignore[return-value]
+        try:
+            return compiler_disable(reason="Spectrum WAN forecaster should run eagerly")(fn)  # type: ignore[return-value]
+        except TypeError:
+            return compiler_disable(fn)  # type: ignore[return-value]
     dynamo_disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
     if dynamo_disable is not None:
         return dynamo_disable(fn)  # type: ignore[return-value]
