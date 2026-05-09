@@ -704,6 +704,59 @@ def test_patcher_apply_model_overwrites_stale_runtime_with_current_outer_runtime
     assert inner.seen_transformer_options[_RUNTIME_KEY] is not stale_runtime
 
 
+def test_apply_model_installs_diffusion_wrapper_into_live_transformer_options() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModelWithForward(), _cfg())
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+    transformer_options = {"cond_or_uncond": [0, 1]}
+
+    patched.model.apply_model(
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        transformer_options=transformer_options,
+    )
+
+    wrapper_slot = transformer_options["wrappers"]["diffusion_model"]["spectrum_wan_runtime"]
+    assert transformer_options[_RUNTIME_KEY] is runtime
+    assert wan._spectrum_wan_diffusion_model_wrapper in wrapper_slot
+    assert runtime.last_info["live_diffusion_wrapper_installed"] is True
+
+
+def test_apply_model_installs_live_diffusion_wrapper_once() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModelWithForward(), _cfg())
+    transformer_options = {"cond_or_uncond": [0, 1]}
+
+    for _ in range(2):
+        patched.model.apply_model(
+            torch.ones((1, 1, 2, 2), dtype=torch.float32),
+            torch.tensor([1.0], dtype=torch.float32),
+            torch.zeros((1, 1, 1), dtype=torch.float32),
+            transformer_options=transformer_options,
+        )
+
+    wrapper_slot = transformer_options["wrappers"]["diffusion_model"]["spectrum_wan_runtime"]
+    assert wrapper_slot.count(wan._spectrum_wan_diffusion_model_wrapper) == 1
+
+
+def test_apply_model_finds_positional_transformer_options() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModelWithForward(), _cfg())
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+    transformer_options = {"cond_or_uncond": [0, 1]}
+
+    patched.model.apply_model(
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        None,
+        None,
+        transformer_options,
+    )
+
+    wrapper_slot = transformer_options["wrappers"]["diffusion_model"]["spectrum_wan_runtime"]
+    assert transformer_options[_RUNTIME_KEY] is runtime
+    assert wan._spectrum_wan_diffusion_model_wrapper in wrapper_slot
+
+
 class DummyInnerLegacyForward(DummyInner):
     def __init__(self) -> None:
         super().__init__()

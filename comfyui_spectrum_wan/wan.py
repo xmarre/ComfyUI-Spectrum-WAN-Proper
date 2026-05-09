@@ -124,12 +124,35 @@ def _pad_to_patch_size(x: torch.Tensor, patch_size) -> torch.Tensor:
     return torch.nn.functional.pad(x, pads)
 
 
-def _install_diffusion_model_wrapper(transformer_options: Dict[str, Any]) -> None:
+def _install_diffusion_model_wrapper(transformer_options: Dict[str, Any]) -> bool:
     wrappers = transformer_options.setdefault(_WRAPPERS_KEY, {})
     wrappers_for_type = wrappers.setdefault(_DIFFUSION_MODEL_WRAPPER_TYPE, {})
     slot = wrappers_for_type.setdefault(_DIFFUSION_MODEL_WRAPPER_KEY, [])
-    if _spectrum_wan_diffusion_model_wrapper not in slot:
-        slot.append(_spectrum_wan_diffusion_model_wrapper)
+    if _spectrum_wan_diffusion_model_wrapper in slot:
+        return False
+    slot.append(_spectrum_wan_diffusion_model_wrapper)
+    return True
+
+
+def _apply_model_transformer_options(args, kwargs):
+    if "transformer_options" in kwargs:
+        transformer_options = kwargs.get("transformer_options")
+        if not isinstance(transformer_options, dict):
+            transformer_options = {}
+            kwargs["transformer_options"] = transformer_options
+        return args, kwargs, transformer_options
+
+    args_list = list(args)
+    if len(args_list) >= 6:
+        transformer_options = args_list[5]
+        if not isinstance(transformer_options, dict):
+            transformer_options = {}
+            args_list[5] = transformer_options
+        return tuple(args_list), kwargs, transformer_options
+
+    transformer_options = {}
+    kwargs["transformer_options"] = transformer_options
+    return args, kwargs, transformer_options
 
 
 def _bind_runtime_to_inner(
@@ -169,12 +192,13 @@ def _wrap_outer_apply_model(outer: Any, runtime: SpectrumWanRuntime) -> None:
     def wrapped_apply_model(*args, **kwargs):
         current_runtime = getattr(outer, "_spectrum_wan_runtime", None)
         if isinstance(current_runtime, SpectrumWanRuntime):
-            transformer_options = kwargs.get("transformer_options")
-            if transformer_options is None:
-                transformer_options = {}
-                kwargs["transformer_options"] = transformer_options
-            if isinstance(transformer_options, dict):
-                transformer_options[_RUNTIME_KEY] = current_runtime
+            args, kwargs, transformer_options = _apply_model_transformer_options(args, kwargs)
+            transformer_options[_RUNTIME_KEY] = current_runtime
+            if _install_diffusion_model_wrapper(transformer_options):
+                current_runtime.last_info["live_diffusion_wrapper_installed"] = True
+                if not getattr(outer, "_spectrum_wan_live_wrapper_logged", False):
+                    current_runtime._debug_log("[Spectrum WAN] activated live diffusion_model wrapper")
+                    outer._spectrum_wan_live_wrapper_logged = True
 
             current_root = getattr(outer, "diffusion_model", None)
             current_inner, current_inner_name = _locate_wan_like_descendant(current_root, "model.diffusion_model")
