@@ -35,6 +35,7 @@ _DIFFUSION_MODEL_WRAPPER_TYPE = "diffusion_model"
 _DIFFUSION_MODEL_WRAPPER_KEY = "spectrum_wan_runtime"
 _APPLY_MODEL_WRAPPER_TYPE = "apply_model"
 _APPLY_MODEL_WRAPPER_KEY = "spectrum_wan_runtime"
+_APPLY_DRIVER_ACTIVE_KEY = "spectrum_wan_apply_driver_active"
 
 
 def _clone_model(model: Any) -> Any:
@@ -937,6 +938,285 @@ def _run_spectrum_forward(
     return out
 
 
+
+def _call_apply_executor_with_feature_capture(
+    executor,
+    inner: Any,
+    runtime: SpectrumWanRuntime,
+    decision: Dict[str, Any],
+    x,
+    timestep,
+    c_concat=None,
+    c_crossattn=None,
+    control=None,
+    transformer_options=None,
+    **kwargs,
+):
+    if transformer_options is None:
+        transformer_options = {}
+
+    original_patches_replace = transformer_options.get("patches_replace", None)
+    patches_replace = dict(original_patches_replace) if isinstance(original_patches_replace, dict) else {}
+    dit_replace = dict(patches_replace.get("dit", {})) if isinstance(patches_replace.get("dit", {}), dict) else {}
+    block_key = ("double_block", max(len(getattr(inner, "blocks", ())) - 1, 0))
+    previous_patch = dit_replace.get(block_key)
+    capture_state = {"observed": False}
+
+    def capture_last_block(args, extra_options):
+        if callable(previous_patch):
+            out = previous_patch(args, extra_options)
+        else:
+            original_block = extra_options.get("original_block") if isinstance(extra_options, dict) else None
+            if not callable(original_block):
+                raise RuntimeError("Spectrum WAN apply capture patch missing original_block")
+            out = original_block(args)
+
+        feature = out.get("img") if isinstance(out, dict) else None
+        if torch.is_tensor(feature):
+            runtime.observe_feature(
+                transformer_options,
+                int(decision["step_idx"]),
+                feature,
+                global_step=decision.get("global_step"),
+            )
+            capture_state["observed"] = True
+        return out
+
+    dit_replace[block_key] = capture_last_block
+    patches_replace["dit"] = dit_replace
+    transformer_options["patches_replace"] = patches_replace
+    previous_apply_driver = transformer_options.get(_APPLY_DRIVER_ACTIVE_KEY, None)
+    transformer_options[_APPLY_DRIVER_ACTIVE_KEY] = True
+
+    try:
+        out = executor(
+            x,
+            timestep,
+            c_concat,
+            c_crossattn,
+            control,
+            transformer_options,
+            **kwargs,
+        )
+    finally:
+        if original_patches_replace is None:
+            transformer_options.pop("patches_replace", None)
+        else:
+            transformer_options["patches_replace"] = original_patches_replace
+        if previous_apply_driver is None:
+            transformer_options.pop(_APPLY_DRIVER_ACTIVE_KEY, None)
+        else:
+            transformer_options[_APPLY_DRIVER_ACTIVE_KEY] = previous_apply_driver
+
+    if not capture_state["observed"]:
+        runtime.last_info["feature_capture"] = "missed_apply_last_block"
+        runtime._debug_log(
+            "[Spectrum WAN] apply feature_capture missed "
+            f"block_key={block_key} "
+            f"blocks={len(getattr(inner, 'blocks', ())) if inner is not None else 0}"
+        )
+    else:
+        runtime.last_info["feature_capture"] = "apply_last_block"
+    return out
+
+
+def _prepare_apply_model_wan_input(
+    outer: Any,
+    inner: Any,
+    x,
+    timestep,
+    c_concat=None,
+    c_crossattn=None,
+    transformer_options=None,
+    **kwargs,
+):
+    if transformer_options is None:
+        transformer_options = {}
+    if not all(callable(getattr(outer, attr, None)) for attr in ("get_dtype_inference", "process_timestep")):
+        raise RuntimeError("outer model does not expose the required apply_model API")
+    model_sampling = getattr(outer, "model_sampling", None)
+    if not all(callable(getattr(model_sampling, attr, None)) for attr in ("calculate_input", "timestep", "calculate_denoised")):
+        raise RuntimeError("outer model_sampling does not expose the required API")
+
+    sigma = timestep
+    xc = model_sampling.calculate_input(sigma, x)
+    dtype = outer.get_dtype_inference()
+    if c_concat is not None:
+        xc = torch.cat([xc, _cast_to_device(c_concat, xc.device, xc.dtype)], dim=1)
+    context = c_crossattn
+    xc = xc.to(dtype)
+    device = xc.device
+    t = model_sampling.timestep(timestep).float()
+    if context is not None:
+        context = _cast_to_device(context, device, dtype)
+
+    extra_conds = {key: _convert_extra_cond(value, device, dtype) for key, value in kwargs.items()}
+    t = outer.process_timestep(t, x=x, **extra_conds)
+    xc, was_unpacked = _try_unpack_latents(xc, extra_conds)
+
+    _, _, orig_t, orig_h, orig_w = xc.shape
+    padded_x = _pad_to_patch_size(xc, inner.patch_size)
+    time_dim_concat = extra_conds.get("time_dim_concat", None)
+    if time_dim_concat is not None:
+        padded_time_dim_concat = _pad_to_patch_size(time_dim_concat, inner.patch_size)
+        padded_x = torch.cat([padded_x, padded_time_dim_concat], dim=2)
+
+    return {
+        "sigma": sigma,
+        "model_sampling": model_sampling,
+        "x_orig": x,
+        "x_model": padded_x,
+        "t": t,
+        "context": context,
+        "extra_conds": extra_conds,
+        "was_unpacked": was_unpacked,
+        "crop_shape": (int(orig_t), int(orig_h), int(orig_w)),
+    }
+
+
+def _run_apply_model_forecast_output(
+    outer: Any,
+    inner: Any,
+    runtime: SpectrumWanRuntime,
+    decision: Dict[str, Any],
+    x,
+    timestep,
+    c_concat=None,
+    c_crossattn=None,
+    control=None,
+    transformer_options=None,
+    **kwargs,
+):
+    if transformer_options is None:
+        transformer_options = {}
+    if control is not None:
+        runtime.last_info["apply_forecast_skipped"] = "control"
+        return None
+
+    try:
+        predicted_x = runtime.predict_feature(
+            transformer_options,
+            int(decision["step_idx"]),
+            global_step=decision.get("global_step"),
+        )
+    except Exception as exc:
+        runtime.last_info["forecast_error"] = f"{type(exc).__name__}: {exc}"
+        runtime._debug_log(
+            f"[Spectrum WAN] forecast_error step={decision.get('step_idx')} "
+            f"global_step={decision.get('global_step')} {type(exc).__name__}: {exc}"
+        )
+        return None
+
+    try:
+        state = _prepare_apply_model_wan_input(
+            outer,
+            inner,
+            x,
+            timestep,
+            c_concat=c_concat,
+            c_crossattn=c_crossattn,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
+        clip_fea = state["extra_conds"].get("clip_fea", None)
+        forecast_extra_conds = {key: value for key, value in state["extra_conds"].items() if key != "clip_fea"}
+        grid_sizes, head_emb, full_ref_len, _context_img_len = _prepare_wan_forecast_output_state(
+            inner,
+            state["x_model"],
+            state["t"],
+            state["context"],
+            clip_fea=clip_fea,
+            **forecast_extra_conds,
+        )
+        predicted_x = predicted_x.to(device=head_emb.device, dtype=head_emb.dtype)
+        if predicted_x.shape[-1] != getattr(inner.head, "dim", predicted_x.shape[-1]):
+            runtime.last_info["forecast_error"] = "predicted feature dimension does not match head"
+            return None
+        if not torch.isfinite(predicted_x).all():
+            runtime.last_info["forecast_error"] = "predicted feature contains non-finite values"
+            return None
+
+        out_tokens = inner.head(predicted_x, head_emb)
+        if full_ref_len:
+            out_tokens = out_tokens[:, full_ref_len:]
+        model_output = inner.unpatchify(out_tokens, grid_sizes)
+        orig_t, orig_h, orig_w = state["crop_shape"]
+        model_output = model_output[:, :, :orig_t, :orig_h, :orig_w]
+        model_output = _try_pack_latents(model_output, state["was_unpacked"])
+        return state["model_sampling"].calculate_denoised(state["sigma"], model_output.float(), state["x_orig"])
+    except Exception as exc:
+        runtime.last_info["apply_forecast_error"] = f"{type(exc).__name__}: {exc}"
+        runtime._debug_log(
+            "[Spectrum WAN] apply_model forecast fallback "
+            f"inner_type={type(inner).__name__ if inner is not None else None} "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        return None
+
+
+def _run_wan21_from_apply_model_wrapper(
+    executor,
+    outer: Any,
+    inner: Any,
+    runtime: SpectrumWanRuntime,
+    x,
+    timestep,
+    c_concat=None,
+    c_crossattn=None,
+    control=None,
+    transformer_options=None,
+    **kwargs,
+):
+    if transformer_options is None:
+        transformer_options = {}
+    if runtime.handler.backend_id != "wan21":
+        return None
+    if inner is None or _spectrum_runtime_missing_attrs(inner):
+        return None
+
+    transformer_options[_RUNTIME_KEY] = runtime
+    decision = runtime.begin_step(transformer_options, timestep)
+    step_idx = int(decision["step_idx"])
+
+    if not decision["actual_forward"] and runtime.can_forecast(transformer_options):
+        forecasted = _run_apply_model_forecast_output(
+            outer,
+            inner,
+            runtime,
+            decision,
+            x,
+            timestep,
+            c_concat=c_concat,
+            c_crossattn=c_crossattn,
+            control=control,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
+        if forecasted is not None:
+            runtime.end_step(transformer_options, step_idx)
+            return forecasted
+
+    try:
+        out = _call_apply_executor_with_feature_capture(
+            executor,
+            inner,
+            runtime,
+            decision,
+            x,
+            timestep,
+            c_concat=c_concat,
+            c_crossattn=c_crossattn,
+            control=control,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
+    except Exception as exc:
+        runtime.last_info["apply_driver_error"] = f"{type(exc).__name__}: {exc}"
+        runtime.reset_all()
+        raise
+    runtime.end_step(transformer_options, step_idx)
+    return out
+
 def _spectrum_wan_apply_model_wrapper(
     executor,
     x,
@@ -1000,10 +1280,27 @@ def _spectrum_wan_apply_model_wrapper(
                 f"root_type={runtime.last_info['live_inner_root_type']}"
             )
 
-        # Do not run the WAN block loop directly from APPLY_MODEL. At this layer
-        # Comfy's dynamic-VRAM/lazy-cast machinery may not have materialized all
-        # block weights yet. The lower forward_orig hook runs inside the native
-        # WAN call after Comfy has prepared the model state.
+        if current_inner is not None and runtime.handler.backend_id == "wan21":
+            apply_result = _run_wan21_from_apply_model_wrapper(
+                executor,
+                outer,
+                current_inner,
+                runtime,
+                x,
+                timestep,
+                c_concat=c_concat,
+                c_crossattn=c_crossattn,
+                control=control,
+                transformer_options=transformer_options,
+                **kwargs,
+            )
+            if apply_result is not None:
+                return apply_result
+
+        # WAN 2.2 uses the lower native forward_orig hook that was already working.
+        # WAN 2.1 only reaches the APPLY_MODEL wrapper on some current Comfy paths,
+        # so it is handled above by driving the runtime decision here and capturing
+        # the native last-block feature through patches_replace.
 
     return executor(
         x,
@@ -1079,6 +1376,16 @@ def _wrap_wan_forward_orig(inner: Any) -> None:
         **kwargs,
     ):
         runtime = _resolve_runtime(transformer_options)
+        if isinstance(transformer_options, dict) and transformer_options.get(_APPLY_DRIVER_ACTIVE_KEY):
+            return original_forward_orig(
+                x,
+                t,
+                context,
+                clip_fea=clip_fea,
+                freqs=freqs,
+                transformer_options=transformer_options,
+                **kwargs,
+            )
         if runtime is None or not runtime.cfg.enabled:
             if transformer_options is None:
                 return original_forward_orig(x, t, context, clip_fea=clip_fea, freqs=freqs, **kwargs)
