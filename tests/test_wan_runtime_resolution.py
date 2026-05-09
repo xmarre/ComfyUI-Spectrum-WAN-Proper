@@ -801,3 +801,84 @@ def test_run_spectrum_forward_clears_stale_forecast_error_before_non_forecast_st
     assert torch.is_tensor(out)
     assert "forecast_error" not in runtime.last_info
     assert runtime.observed == [(3, 8, (1, 4, 1))]
+
+
+class DummyInnerForDiffusionWrapper(DummyInner):
+    patch_size = (1, 1, 1)
+
+    def rope_encode(self, t, h, w, device=None, dtype=None, transformer_options=None):
+        return torch.zeros((1,), device=device, dtype=dtype)
+
+    def unpatchify(self, x, grid_sizes):
+        return torch.zeros((1, 1, *grid_sizes), dtype=x.dtype, device=x.device)
+
+
+class DummyModelForDiffusionWrapper(DummyModel):
+    def __init__(self) -> None:
+        self.model = DummyOuter(DummyInnerForDiffusionWrapper())
+        self.model_options = None
+
+
+class DummyDiffusionExecutor:
+    def __init__(self, class_obj) -> None:
+        self.class_obj = class_obj
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return torch.full((1, 1, 1, 1, 1), -1.0)
+
+
+def test_patcher_installs_diffusion_model_wrapper() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModelForDiffusionWrapper(), _cfg())
+    wrapper_slot = patched.model_options["transformer_options"]["wrappers"]["diffusion_model"]["spectrum_wan_runtime"]
+
+    assert wan._spectrum_wan_diffusion_model_wrapper in wrapper_slot
+
+
+def test_diffusion_model_wrapper_runs_spectrum_without_calling_captured_forward_executor() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModelForDiffusionWrapper(), _cfg())
+    inner = patched.model.diffusion_model
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+    executor = DummyDiffusionExecutor(inner)
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
+    transformer_options = {
+        _RUNTIME_KEY: runtime,
+        "sample_sigmas": sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
+
+    out = wan._spectrum_wan_diffusion_model_wrapper(
+        executor,
+        torch.ones((1, 1, 2, 2, 2), dtype=torch.float32),
+        torch.tensor([sample_sigmas[0]], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        None,
+        None,
+        transformer_options,
+    )
+
+    assert executor.calls == 0
+    assert torch.is_tensor(out)
+    assert tuple(out.shape) == (1, 1, 2, 2, 2)
+    assert inner.original_calls == 0
+    assert runtime.last_info["last_sigma"] == 1.0
+
+
+def test_diffusion_model_wrapper_falls_back_for_non_wan_executor_target() -> None:
+    cfg = _cfg()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("auto", DummyModelForDiffusionWrapper()))
+    executor = DummyDiffusionExecutor(NonWanInner())
+
+    out = wan._spectrum_wan_diffusion_model_wrapper(
+        executor,
+        torch.ones((1, 1, 2, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        None,
+        None,
+        {_RUNTIME_KEY: runtime},
+    )
+
+    assert executor.calls == 1
+    assert torch.equal(out, torch.full((1, 1, 1, 1, 1), -1.0))

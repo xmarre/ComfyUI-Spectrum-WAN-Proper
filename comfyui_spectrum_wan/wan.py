@@ -22,6 +22,9 @@ _RUNTIME_KEY = "spectrum_wan_runtime"
 _CFG_KEY = "spectrum_wan_cfg"
 _ENABLED_KEY = "spectrum_wan_enabled"
 _BACKEND_KEY = "spectrum_wan_backend"
+_WRAPPERS_KEY = "wrappers"
+_DIFFUSION_MODEL_WRAPPER_TYPE = "diffusion_model"
+_DIFFUSION_MODEL_WRAPPER_KEY = "spectrum_wan_runtime"
 
 
 def _clone_model(model: Any) -> Any:
@@ -95,6 +98,38 @@ def _spectrum_runtime_missing_attrs(inner: Any) -> Tuple[str, ...]:
             ]
         )
     return tuple(missing)
+
+
+def _pad_to_patch_size(x: torch.Tensor, patch_size) -> torch.Tensor:
+    try:
+        from comfy.ldm.common_dit import pad_to_patch_size
+    except ModuleNotFoundError as exc:  # pragma: no cover - ComfyUI is unavailable in unit tests.
+        if not (exc.name and exc.name.startswith("comfy")):
+            raise
+        pad_to_patch_size = None
+
+    if pad_to_patch_size is not None:
+        return pad_to_patch_size(x, patch_size)
+
+    # Test fallback that mirrors Comfy's right-side padding for 3D latent tensors.
+    if x.ndim < 5:
+        return x
+    spatial = x.shape[-len(patch_size):]
+    pads = []
+    for size, patch in reversed(list(zip(spatial, patch_size))):
+        remainder = int(size) % int(patch)
+        pads.extend((0, 0 if remainder == 0 else int(patch) - remainder))
+    if not any(pads):
+        return x
+    return torch.nn.functional.pad(x, pads)
+
+
+def _install_diffusion_model_wrapper(transformer_options: Dict[str, Any]) -> None:
+    wrappers = transformer_options.setdefault(_WRAPPERS_KEY, {})
+    wrappers_for_type = wrappers.setdefault(_DIFFUSION_MODEL_WRAPPER_TYPE, {})
+    slot = wrappers_for_type.setdefault(_DIFFUSION_MODEL_WRAPPER_KEY, [])
+    if _spectrum_wan_diffusion_model_wrapper not in slot:
+        slot.append(_spectrum_wan_diffusion_model_wrapper)
 
 
 def _bind_runtime_to_inner(
@@ -364,6 +399,109 @@ def _run_spectrum_forward(
     return out
 
 
+def _spectrum_wan_diffusion_model_wrapper(
+    executor,
+    x,
+    timestep,
+    context,
+    clip_fea=None,
+    time_dim_concat=None,
+    transformer_options=None,
+    **kwargs,
+):
+    if transformer_options is None:
+        transformer_options = {}
+
+    inner = getattr(executor, "class_obj", None)
+    runtime = _resolve_runtime(transformer_options)
+    if runtime is None and inner is not None:
+        bound_runtime = getattr(inner, "_spectrum_wan_runtime", None)
+        if isinstance(bound_runtime, SpectrumWanRuntime):
+            runtime = bound_runtime
+            transformer_options[_RUNTIME_KEY] = runtime
+
+    if runtime is None or not runtime.cfg.enabled or inner is None:
+        return executor(
+            x,
+            timestep,
+            context,
+            clip_fea,
+            time_dim_concat,
+            transformer_options,
+            **kwargs,
+        )
+
+    missing = _spectrum_runtime_missing_attrs(inner)
+    if missing or not callable(getattr(inner, "rope_encode", None)) or not hasattr(inner, "patch_size"):
+        if missing:
+            runtime.last_info["runtime_missing_attrs"] = list(missing)
+        if not callable(getattr(inner, "rope_encode", None)):
+            runtime.last_info["runtime_missing_rope_encode"] = True
+        runtime._debug_log(
+            "[Spectrum WAN] diffusion wrapper fallback "
+            f"inner_type={type(inner).__name__} "
+            f"missing_attrs={','.join(missing) if missing else '-'} "
+            f"has_rope_encode={callable(getattr(inner, 'rope_encode', None))}"
+        )
+        return executor(
+            x,
+            timestep,
+            context,
+            clip_fea,
+            time_dim_concat,
+            transformer_options,
+            **kwargs,
+        )
+
+    try:
+        _, _, orig_t, orig_h, orig_w = x.shape
+        padded_x = _pad_to_patch_size(x, inner.patch_size)
+        rope_t = orig_t
+        if time_dim_concat is not None:
+            padded_time_dim_concat = _pad_to_patch_size(time_dim_concat, inner.patch_size)
+            padded_x = torch.cat([padded_x, padded_time_dim_concat], dim=2)
+            rope_t = padded_x.shape[2]
+        if getattr(inner, "ref_conv", None) is not None and "reference_latent" in kwargs:
+            rope_t += 1
+        freqs = inner.rope_encode(
+            rope_t,
+            orig_h,
+            orig_w,
+            device=padded_x.device,
+            dtype=padded_x.dtype,
+            transformer_options=transformer_options,
+        )
+        out = _run_spectrum_forward(
+            inner,
+            runtime,
+            padded_x,
+            timestep,
+            context,
+            clip_fea=clip_fea,
+            freqs=freqs,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
+        return out[:, :, :orig_t, :orig_h, :orig_w]
+    except Exception as exc:
+        runtime.last_info["diffusion_wrapper_error"] = f"{type(exc).__name__}: {exc}"
+        runtime._debug_log(
+            "[Spectrum WAN] diffusion wrapper fallback "
+            f"inner_type={type(inner).__name__} "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        runtime.reset_all()
+        return executor(
+            x,
+            timestep,
+            context,
+            clip_fea,
+            time_dim_concat,
+            transformer_options,
+            **kwargs,
+        )
+
+
 def _wrap_wan_forward_orig(inner: Any) -> None:
     if getattr(inner, "_spectrum_wan_wrapped", False):
         return
@@ -492,6 +630,9 @@ class WanSpectrumPatcher:
             "phase_tag": handler.phase_tag,
             "is_moe_expert": handler.is_moe_expert,
         }
+        _install_diffusion_model_wrapper(tr_opts)
+        if cfg.debug:
+            print("[Spectrum WAN] installed diffusion_model wrapper", file=sys.stderr, flush=True)
 
         outer = getattr(patched, "model", None)
         _wrap_outer_apply_model(outer, runtime)
