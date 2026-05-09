@@ -17,6 +17,7 @@ _HIGH_TO_LOW_DIRECTION = "wan22_high_noise->wan22_low_noise"
 _RUN_TOKEN_KEY = "spectrum_wan_run_token"
 _GLOBAL_STEP_OVERRIDE_KEY = "spectrum_wan_global_step_override"
 _GLOBAL_STEP_KEY = "spectrum_wan_global_step"
+_ACTIVE_NUM_STEPS_KEY = "spectrum_wan_active_num_steps"
 _TRANSITION_HANDOFF_LIMIT = 16
 _RUN_TOKEN_COUNTER = count(1)
 _TRANSITION_HANDOFFS: "OrderedDict[Tuple[int, Tuple[int, ...], str], _PublishedTransitionHandoff]" = OrderedDict()
@@ -348,15 +349,19 @@ class SpectrumWanRuntime:
     def _ensure_run_sync(self, transformer_options: Dict[str, Any]) -> None:
         sig = self._schedule_signature(transformer_options)
         if sig is None:
+            transformer_options.pop(_ACTIVE_NUM_STEPS_KEY, None)
+            self.last_info["num_steps"] = 0
             return
+        num_steps = max(len(sig) - 1, 1)
+        transformer_options[_ACTIVE_NUM_STEPS_KEY] = num_steps
         if self._last_schedule_signature is None:
             self._last_schedule_signature = sig
-            self.last_info["num_steps"] = max(len(sig) - 1, 1)
+            self.last_info["num_steps"] = num_steps
             return
         if sig != self._last_schedule_signature:
             self.run_id += 1
             self._last_schedule_signature = sig
-            self.last_info["num_steps"] = max(len(sig) - 1, 1)
+            self.last_info["num_steps"] = num_steps
             self.reset_all()
 
     def _stream_key(self, transformer_options: Dict[str, Any]) -> Tuple[str, Tuple[int, ...]]:
@@ -371,12 +376,22 @@ class SpectrumWanRuntime:
     def num_steps(self) -> int:
         return max(int(self.last_info.get("num_steps", 0)), 1)
 
-    def _has_known_num_steps(self) -> bool:
-        return self._last_schedule_signature is not None and int(self.last_info.get("num_steps", 0) or 0) > 0
+    def _known_num_steps(self, transformer_options: Dict[str, Any]) -> Optional[int]:
+        value = transformer_options.get(_ACTIVE_NUM_STEPS_KEY)
+        if value is None:
+            return None
+        num_steps = self._parse_metadata_int(value, _ACTIVE_NUM_STEPS_KEY)
+        return num_steps if num_steps > 0 else None
 
-    def _stream_num_steps(self, stream: _StreamState, step_idx: Optional[int] = None) -> int:
-        if self._has_known_num_steps():
-            return self.num_steps()
+    def _stream_num_steps(
+        self,
+        stream: _StreamState,
+        transformer_options: Dict[str, Any],
+        step_idx: Optional[int] = None,
+    ) -> int:
+        known_num_steps = self._known_num_steps(transformer_options)
+        if known_num_steps is not None:
+            return known_num_steps
 
         observed_steps = len(stream.seen_sigmas)
         if step_idx is not None:
@@ -391,13 +406,14 @@ class SpectrumWanRuntime:
         return max(observed_steps + 1, 2)
 
     def end_step(self, transformer_options: Dict[str, Any], step_idx: int) -> None:
-        if not self._has_known_num_steps():
+        known_num_steps = self._known_num_steps(transformer_options)
+        if known_num_steps is None:
             return
 
-        if int(step_idx) + 1 < self.num_steps():
+        if int(step_idx) + 1 < known_num_steps:
             return
 
-        final_num_steps = self.num_steps()
+        final_num_steps = known_num_steps
         key = self._stream_key(transformer_options)
         stream = self.streams.get(key)
         if stream is None:
@@ -538,7 +554,7 @@ class SpectrumWanRuntime:
         sigma = self.sigma_key(transformer_options, timesteps)
         self.last_info["last_sigma"] = sigma
 
-        known_num_steps = self.num_steps() if self._has_known_num_steps() else None
+        known_num_steps = self._known_num_steps(transformer_options)
         if known_num_steps is not None and len(stream.seen_sigmas) >= known_num_steps and not stream.cycle_finished:
             stream.cycle_finished = True
         if stream.cycle_finished:
@@ -565,7 +581,7 @@ class SpectrumWanRuntime:
                     stream.bias_shift_predictor = _BiasShiftPredictor.from_handoff(self.cfg, handoff)
 
         global_step = self._global_step(transformer_options, stream, step_idx)
-        total_steps = self._stream_num_steps(stream, step_idx)
+        total_steps = self._stream_num_steps(stream, transformer_options, step_idx)
         stream.last_processed_global_step = int(global_step)
         transformer_options[_GLOBAL_STEP_KEY] = int(global_step)
 
@@ -648,7 +664,7 @@ class SpectrumWanRuntime:
                 feature_ref,
                 low_step_idx=int(step_idx),
                 explicit_global_step=explicit_global_step,
-                local_total_steps=self._stream_num_steps(stream, int(step_idx)),
+                local_total_steps=self._stream_num_steps(stream, transformer_options, int(step_idx)),
             ):
                 stream.bias_shift_predictor = None
 
@@ -671,10 +687,10 @@ class SpectrumWanRuntime:
                 return stream.bias_shift_predictor.predict(
                     low_step_idx=int(step_idx),
                     explicit_global_step=None if global_step is None else int(global_step),
-                    local_total_steps=self._stream_num_steps(stream, int(step_idx)),
+                    local_total_steps=self._stream_num_steps(stream, transformer_options, int(step_idx)),
                 )
             except Exception:
                 stream.bias_shift_predictor = None
                 raise
         assert stream.forecaster is not None
-        return stream.forecaster.predict(step_idx, self._stream_num_steps(stream, int(step_idx)))
+        return stream.forecaster.predict(step_idx, self._stream_num_steps(stream, transformer_options, int(step_idx)))
