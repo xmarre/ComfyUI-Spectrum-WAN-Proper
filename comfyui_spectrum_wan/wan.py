@@ -591,6 +591,199 @@ def _run_spectrum_from_apply_model_direct(
         return None
 
 
+def _prepare_wan_forecast_output_state(
+    inner: Any,
+    x,
+    t,
+    context,
+    clip_fea=None,
+    **kwargs,
+):
+    x = inner.patch_embedding(x.float()).to(x.dtype)
+    grid_sizes = x.shape[2:]
+    x = x.flatten(2).transpose(1, 2)
+    context_img_len = None
+
+    if _has_legacy_conditioning(inner):
+        temb, _timestep_proj, encoder_hidden_states, encoder_hidden_states_image = inner.condition_embedder(
+            t, context, clip_fea
+        )
+        if encoder_hidden_states_image is not None:
+            encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+        head_emb = temb
+        context_img_len = clip_fea.shape[-2] if clip_fea is not None else None
+    else:
+        timestep_shape = t.shape
+        head_emb = inner.time_embedding(
+            _sinusoidal_embedding_1d(inner.freq_dim, t.reshape(-1)).to(dtype=x[0].dtype, device=t.device)
+        )
+        head_emb = head_emb.reshape(*timestep_shape, head_emb.shape[-1])
+        encoder_hidden_states = inner.text_embedding(context)
+
+        if clip_fea is not None and callable(getattr(inner, "img_emb", None)):
+            encoder_hidden_states_image = inner.img_emb(clip_fea)
+            encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+            context_img_len = encoder_hidden_states_image.shape[1]
+
+    full_ref_len = 0
+    if getattr(inner, "ref_conv", None) is not None:
+        full_ref = kwargs.get("reference_latent", None)
+        if full_ref is not None:
+            full_ref = inner.ref_conv(full_ref).flatten(2).transpose(1, 2)
+            full_ref_len = int(full_ref.shape[1])
+
+    return grid_sizes, head_emb, full_ref_len, context_img_len
+
+
+def _call_original_forward_with_feature_capture(
+    inner: Any,
+    runtime: SpectrumWanRuntime,
+    original_forward_orig,
+    x,
+    t,
+    context,
+    clip_fea=None,
+    freqs=None,
+    transformer_options=None,
+    step_idx: int = 0,
+    global_step: Optional[int] = None,
+    **kwargs,
+):
+    if transformer_options is None:
+        transformer_options = {}
+
+    original_patches_replace = transformer_options.get("patches_replace", None)
+    patches_replace = dict(original_patches_replace) if isinstance(original_patches_replace, dict) else {}
+    dit_replace = dict(patches_replace.get("dit", {})) if isinstance(patches_replace.get("dit", {}), dict) else {}
+    block_key = ("double_block", max(len(getattr(inner, "blocks", ())) - 1, 0))
+    previous_patch = dit_replace.get(block_key)
+    capture_state = {"observed": False}
+
+    def capture_last_block(args, extra_options):
+        if callable(previous_patch):
+            out = previous_patch(args, extra_options)
+        else:
+            original_block = extra_options.get("original_block") if isinstance(extra_options, dict) else None
+            if not callable(original_block):
+                raise RuntimeError("Spectrum WAN capture patch missing original_block")
+            out = original_block(args)
+
+        feature = out.get("img") if isinstance(out, dict) else None
+        if torch.is_tensor(feature):
+            runtime.observe_feature(
+                transformer_options,
+                int(step_idx),
+                feature,
+                global_step=None if global_step is None else int(global_step),
+            )
+            capture_state["observed"] = True
+        return out
+
+    dit_replace[block_key] = capture_last_block
+    patches_replace["dit"] = dit_replace
+    transformer_options["patches_replace"] = patches_replace
+
+    try:
+        out = original_forward_orig(
+            x,
+            t,
+            context,
+            clip_fea=clip_fea,
+            freqs=freqs,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
+    finally:
+        if original_patches_replace is None:
+            transformer_options.pop("patches_replace", None)
+        else:
+            transformer_options["patches_replace"] = original_patches_replace
+
+    if not capture_state["observed"]:
+        runtime.last_info["feature_capture"] = "missed_last_block"
+        runtime._debug_log(
+            "[Spectrum WAN] feature_capture missed "
+            f"block_key={block_key} "
+            f"blocks={len(getattr(inner, 'blocks', ())) if inner is not None else 0}"
+        )
+    else:
+        runtime.last_info["feature_capture"] = "last_block"
+    return out
+
+
+def _run_spectrum_forward_via_original(
+    inner: Any,
+    runtime: SpectrumWanRuntime,
+    original_forward_orig,
+    x,
+    t,
+    context,
+    clip_fea=None,
+    freqs=None,
+    transformer_options=None,
+    **kwargs,
+):
+    if transformer_options is None:
+        transformer_options = {}
+
+    transformer_options[_RUNTIME_KEY] = runtime
+    decision = runtime.begin_step(transformer_options, t)
+    step_idx = decision["step_idx"]
+    actual_forward = decision["actual_forward"]
+
+    runtime.last_info.pop("forecast_error", None)
+
+    if not actual_forward and runtime.can_forecast(transformer_options):
+        try:
+            predicted_x = runtime.predict_feature(
+                transformer_options,
+                step_idx,
+                global_step=decision.get("global_step"),
+            )
+        except Exception as exc:
+            runtime.last_info["forecast_error"] = f"{type(exc).__name__}: {exc}"
+            runtime._debug_log(
+                f"[Spectrum WAN] forecast_error step={step_idx} "
+                f"global_step={decision.get('global_step')} {type(exc).__name__}: {exc}"
+            )
+            predicted_x = None
+
+        if predicted_x is not None:
+            grid_sizes, head_emb, full_ref_len, _context_img_len = _prepare_wan_forecast_output_state(
+                inner,
+                x,
+                t,
+                context,
+                clip_fea=clip_fea,
+                **kwargs,
+            )
+            predicted_x = predicted_x.to(device=head_emb.device, dtype=head_emb.dtype)
+            if torch.isfinite(predicted_x).all():
+                out_tokens = inner.head(predicted_x, head_emb)
+                if full_ref_len:
+                    out_tokens = out_tokens[:, full_ref_len:]
+                out = inner.unpatchify(out_tokens, grid_sizes)
+                runtime.end_step(transformer_options, step_idx)
+                return out
+
+    out = _call_original_forward_with_feature_capture(
+        inner,
+        runtime,
+        original_forward_orig,
+        x,
+        t,
+        context,
+        clip_fea=clip_fea,
+        freqs=freqs,
+        transformer_options=transformer_options,
+        step_idx=int(step_idx),
+        global_step=decision.get("global_step"),
+        **kwargs,
+    )
+    runtime.end_step(transformer_options, step_idx)
+    return out
+
+
 def _run_spectrum_forward(
     inner: Any,
     runtime: SpectrumWanRuntime,
@@ -600,8 +793,23 @@ def _run_spectrum_forward(
     clip_fea=None,
     freqs=None,
     transformer_options=None,
+    original_forward_orig=None,
     **kwargs,
 ):
+    if original_forward_orig is not None:
+        return _run_spectrum_forward_via_original(
+            inner,
+            runtime,
+            original_forward_orig,
+            x,
+            t,
+            context,
+            clip_fea=clip_fea,
+            freqs=freqs,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
+
     if transformer_options is None:
         transformer_options = {}
 
@@ -792,29 +1000,10 @@ def _spectrum_wan_apply_model_wrapper(
                 f"root_type={runtime.last_info['live_inner_root_type']}"
             )
 
-        # WAN 2.1 can bypass the WanModel diffusion wrapper path entirely in some
-        # ComfyUI loader stacks. WAN 2.2 already works through the lower-level hook,
-        # so keep the apply-level short-circuit scoped to WAN 2.1 to avoid
-        # bypassing unrelated apply_model wrappers for working backends.
-        if bound and runtime.handler.backend_id == "wan21":
-            direct_out = _run_spectrum_from_apply_model_direct(
-                outer,
-                current_inner,
-                runtime,
-                x,
-                timestep,
-                c_concat=c_concat,
-                c_crossattn=c_crossattn,
-                control=control,
-                transformer_options=transformer_options,
-                **kwargs,
-            )
-            if direct_out is not None:
-                if not getattr(outer, "_spectrum_wan_apply_direct_logged", False):
-                    runtime._debug_log("[Spectrum WAN] apply_model direct path active")
-                    if outer is not None:
-                        outer._spectrum_wan_apply_direct_logged = True
-                return direct_out
+        # Do not run the WAN block loop directly from APPLY_MODEL. At this layer
+        # Comfy's dynamic-VRAM/lazy-cast machinery may not have materialized all
+        # block weights yet. The lower forward_orig hook runs inside the native
+        # WAN call after Comfy has prepared the model state.
 
     return executor(
         x,
@@ -859,41 +1048,19 @@ def _spectrum_wan_diffusion_model_wrapper(
             **kwargs,
         )
 
-    try:
-        out = _run_spectrum_diffusion_model_direct(
-            inner,
-            runtime,
-            x,
-            timestep,
-            context,
-            clip_fea=clip_fea,
-            time_dim_concat=time_dim_concat,
-            transformer_options=transformer_options,
-            **kwargs,
-        )
-        if out is not None:
-            return out
-        return executor(
-            x,
-            timestep,
-            context,
-            clip_fea,
-            time_dim_concat,
-            transformer_options,
-            **kwargs,
-        )
-    except Exception as exc:
-        _spectrum_wan_diffusion_fallback_log(runtime, inner, "direct_error", exc=exc)
-        runtime.reset_all()
-        return executor(
-            x,
-            timestep,
-            context,
-            clip_fea,
-            time_dim_concat,
-            transformer_options,
-            **kwargs,
-        )
+    # Let the native WAN _forward/forward_orig path run. The forward_orig hook
+    # below performs the Spectrum decision and captures the post-block feature
+    # through patches_replace, preserving Comfy's attention implementation and
+    # dynamic-VRAM weight lifetime.
+    return executor(
+        x,
+        timestep,
+        context,
+        clip_fea,
+        time_dim_concat,
+        transformer_options,
+        **kwargs,
+    )
 
 
 def _wrap_wan_forward_orig(inner: Any) -> None:
@@ -954,6 +1121,7 @@ def _wrap_wan_forward_orig(inner: Any) -> None:
             clip_fea=clip_fea,
             freqs=freqs,
             transformer_options=transformer_options,
+            original_forward_orig=original_forward_orig,
             **kwargs,
         )
         return out
