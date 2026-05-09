@@ -866,6 +866,18 @@ class DummyInnerForDiffusionWrapper(DummyInner):
         return torch.zeros((1, 1, *grid_sizes), dtype=x.dtype, device=x.device)
 
 
+class PaddedDummyInnerForDiffusionWrapper(DummyInnerForDiffusionWrapper):
+    patch_size = (2, 2, 2)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rope_args = None
+
+    def rope_encode(self, t, h, w, device=None, dtype=None, transformer_options=None):
+        self.rope_args = (t, h, w)
+        return torch.zeros((1,), device=device, dtype=dtype)
+
+
 class DummyModelForDiffusionWrapper(DummyModel):
     def __init__(self) -> None:
         self.model = DummyOuter(DummyInnerForDiffusionWrapper())
@@ -935,3 +947,240 @@ def test_diffusion_model_wrapper_falls_back_for_non_wan_executor_target() -> Non
 
     assert executor.calls == 1
     assert torch.equal(out, torch.full((1, 1, 1, 1, 1), -1.0))
+
+
+class DummySampling:
+    def calculate_input(self, sigma, x):
+        return x
+
+    def timestep(self, timestep):
+        return timestep
+
+    def calculate_denoised(self, sigma, model_output, x):
+        return model_output
+
+
+class DummyBaseOuterForApplyDirect:
+    def __init__(self, inner) -> None:
+        self.diffusion_model = inner
+        self.model_sampling = DummySampling()
+        self.current_patcher = None
+
+    def get_dtype_inference(self):
+        return torch.float32
+
+    def process_timestep(self, timestep, **kwargs):
+        return timestep
+
+
+class DummyApplyExecutor:
+    def __init__(self, class_obj) -> None:
+        self.class_obj = class_obj
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return torch.full((1, 1, 1, 1, 1), -2.0)
+
+
+def test_apply_model_wrapper_without_runtime_uses_executor_path() -> None:
+    outer = DummyBaseOuterForApplyDirect(DummyInnerForDiffusionWrapper())
+    executor = DummyApplyExecutor(outer)
+
+    out = wan._spectrum_wan_apply_model_wrapper(
+        executor,
+        torch.ones((1, 1, 2, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        None,
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        None,
+        {"cond_or_uncond": [0, 1]},
+    )
+
+    assert executor.calls == 1
+    assert torch.equal(out, torch.full((1, 1, 1, 1, 1), -2.0))
+
+
+def test_apply_model_wrapper_can_run_spectrum_direct_when_diffusion_wrapper_is_bypassed() -> None:
+    cfg = _cfg()
+    inner = DummyInnerForDiffusionWrapper()
+    outer = DummyBaseOuterForApplyDirect(inner)
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModelForDiffusionWrapper()))
+    outer._spectrum_wan_runtime = runtime
+    executor = DummyApplyExecutor(outer)
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
+    transformer_options = {
+        "sample_sigmas": sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
+
+    out = wan._spectrum_wan_apply_model_wrapper(
+        executor,
+        torch.ones((1, 1, 2, 2, 2), dtype=torch.float32),
+        torch.tensor([sample_sigmas[0]], dtype=torch.float32),
+        None,
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        None,
+        transformer_options,
+    )
+
+    assert executor.calls == 0
+    assert torch.is_tensor(out)
+    assert tuple(out.shape) == (1, 1, 2, 2, 2)
+    assert inner.original_calls == 0
+    assert runtime.last_info["last_sigma"] == 1.0
+    assert transformer_options[_RUNTIME_KEY] is runtime
+
+
+def test_apply_model_wrapper_direct_path_uses_padded_rope_sizes_and_crops_output() -> None:
+    cfg = _cfg()
+    inner = PaddedDummyInnerForDiffusionWrapper()
+    outer = DummyBaseOuterForApplyDirect(inner)
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModelForDiffusionWrapper()))
+    outer._spectrum_wan_runtime = runtime
+    executor = DummyApplyExecutor(outer)
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
+    transformer_options = {
+        "sample_sigmas": sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
+
+    out = wan._spectrum_wan_apply_model_wrapper(
+        executor,
+        torch.ones((1, 1, 3, 3, 3), dtype=torch.float32),
+        torch.tensor([sample_sigmas[0]], dtype=torch.float32),
+        None,
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        None,
+        transformer_options,
+    )
+
+    assert executor.calls == 0
+    assert torch.is_tensor(out)
+    assert tuple(out.shape) == (1, 1, 3, 3, 3)
+    assert inner.rope_args == (3, 4, 4)
+    assert runtime.last_info["last_sigma"] == 1.0
+    assert transformer_options[_RUNTIME_KEY] is runtime
+
+
+def test_apply_model_wrapper_keeps_wan22_on_executor_path() -> None:
+    cfg = _cfg()
+    inner = DummyInnerForDiffusionWrapper()
+    outer = DummyBaseOuterForApplyDirect(inner)
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan22_high_noise", DummyModelForDiffusionWrapper()))
+    outer._spectrum_wan_runtime = runtime
+    executor = DummyApplyExecutor(outer)
+    transformer_options = {
+        "sample_sigmas": torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32),
+        "cond_or_uncond": [0, 1],
+    }
+
+    out = wan._spectrum_wan_apply_model_wrapper(
+        executor,
+        torch.ones((1, 1, 2, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        None,
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        None,
+        transformer_options,
+    )
+
+    assert executor.calls == 1
+    assert torch.equal(out, torch.full((1, 1, 1, 1, 1), -2.0))
+    assert "last_sigma" not in runtime.last_info
+
+
+def test_apply_model_wrapper_falls_back_when_wan21_direct_inner_is_unsupported() -> None:
+    cfg = _cfg()
+    inner = ForwardOrigOnlyInner()
+    outer = DummyBaseOuterForApplyDirect(inner)
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModelForDiffusionWrapper()))
+    outer._spectrum_wan_runtime = runtime
+    executor = DummyApplyExecutor(outer)
+    transformer_options = {
+        "sample_sigmas": torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32),
+        "cond_or_uncond": [0, 1],
+    }
+
+    out = wan._spectrum_wan_apply_model_wrapper(
+        executor,
+        torch.ones((1, 1, 2, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        None,
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        None,
+        transformer_options,
+    )
+
+    assert executor.calls == 1
+    assert torch.equal(out, torch.full((1, 1, 1, 1, 1), -2.0))
+    assert "runtime_missing_attrs" in runtime.last_info
+    assert "last_sigma" not in runtime.last_info
+
+
+class PackLatentsTupleModule:
+    @staticmethod
+    def pack_latents(model_output):
+        return torch.full((1, 1), 3.0), ["shape"]
+
+
+class PackLatentsTensorModule:
+    @staticmethod
+    def pack_latents(model_output):
+        return torch.full((1, 1), 4.0)
+
+
+class PackLatentsUnsizedModule:
+    @staticmethod
+    def pack_latents(model_output):
+        return torch.full((1, 1), 5.0)
+
+
+class UnsizedLatentOutput:
+    def __len__(self):
+        raise TypeError("unsized")
+
+
+def test_try_pack_latents_accepts_tuple_pack_latents_return() -> None:
+    original = wan._comfy_latent_utils
+    wan._comfy_latent_utils = lambda: [PackLatentsTupleModule]
+    try:
+        out = wan._try_pack_latents([torch.ones((1, 1)), torch.ones((1, 1))], True)
+    finally:
+        wan._comfy_latent_utils = original
+
+    assert torch.equal(out, torch.full((1, 1), 3.0))
+
+
+def test_try_pack_latents_accepts_tensor_pack_latents_return() -> None:
+    original = wan._comfy_latent_utils
+    wan._comfy_latent_utils = lambda: [PackLatentsTensorModule]
+    try:
+        out = wan._try_pack_latents([torch.ones((1, 1)), torch.ones((1, 1))], True)
+    finally:
+        wan._comfy_latent_utils = original
+
+    assert torch.equal(out, torch.full((1, 1), 4.0))
+
+
+def test_try_pack_latents_leaves_unsized_output_unchanged() -> None:
+    original = wan._comfy_latent_utils
+    wan._comfy_latent_utils = lambda: [PackLatentsUnsizedModule]
+    model_output = UnsizedLatentOutput()
+    try:
+        out = wan._try_pack_latents(model_output, True)
+    finally:
+        wan._comfy_latent_utils = original
+
+    assert out is model_output
+
+
+def test_cast_to_device_preserves_non_floating_dtypes() -> None:
+    bool_tensor = torch.tensor([True, False], dtype=torch.bool)
+    int16_tensor = torch.tensor([1, 2], dtype=torch.int16)
+
+    bool_out = wan._cast_to_device(bool_tensor, torch.device("cpu"), torch.float32)
+    int16_out = wan._cast_to_device(int16_tensor, torch.device("cpu"), torch.float32)
+
+    assert bool_out.dtype == torch.bool
+    assert int16_out.dtype == torch.int16
