@@ -7,6 +7,14 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 try:
+    import comfy.patcher_extension as _comfy_patcher_extension
+except ModuleNotFoundError as exc:  # pragma: no cover - ComfyUI is not available in unit tests.
+    if exc.name and exc.name.startswith("comfy"):
+        _comfy_patcher_extension = None
+    else:
+        raise
+
+try:
     from comfy.ldm.wan.model import sinusoidal_embedding_1d as _upstream_sinusoidal_embedding_1d
 except ModuleNotFoundError as exc:  # pragma: no cover - ComfyUI is not available in unit tests.
     if exc.name and exc.name.startswith("comfy"):
@@ -25,6 +33,8 @@ _BACKEND_KEY = "spectrum_wan_backend"
 _WRAPPERS_KEY = "wrappers"
 _DIFFUSION_MODEL_WRAPPER_TYPE = "diffusion_model"
 _DIFFUSION_MODEL_WRAPPER_KEY = "spectrum_wan_runtime"
+_APPLY_MODEL_WRAPPER_TYPE = "apply_model"
+_APPLY_MODEL_WRAPPER_KEY = "spectrum_wan_runtime"
 
 
 def _clone_model(model: Any) -> Any:
@@ -132,6 +142,70 @@ def _install_diffusion_model_wrapper(transformer_options: Dict[str, Any]) -> boo
         return False
     slot.append(_spectrum_wan_diffusion_model_wrapper)
     return True
+
+
+def _install_apply_model_wrapper(transformer_options: Dict[str, Any]) -> bool:
+    wrappers = transformer_options.setdefault(_WRAPPERS_KEY, {})
+    wrappers_for_type = wrappers.setdefault(_APPLY_MODEL_WRAPPER_TYPE, {})
+    slot = wrappers_for_type.setdefault(_APPLY_MODEL_WRAPPER_KEY, [])
+    if _spectrum_wan_apply_model_wrapper in slot:
+        return False
+    slot.append(_spectrum_wan_apply_model_wrapper)
+    return True
+
+
+def _remove_wrapper_with_key_from_mapping(model: Any, wrapper_type: str, key: str) -> None:
+    wrappers = getattr(model, "wrappers", None)
+    if not isinstance(wrappers, dict):
+        return
+    wrappers_for_type = wrappers.get(wrapper_type)
+    if isinstance(wrappers_for_type, dict):
+        wrappers_for_type.pop(key, None)
+
+
+def _replace_model_patcher_wrapper(model: Any, wrapper_type: str, key: str, wrapper) -> bool:
+    if model is None:
+        return False
+
+    if callable(getattr(model, "remove_wrappers_with_key", None)):
+        model.remove_wrappers_with_key(wrapper_type, key)
+    else:
+        _remove_wrapper_with_key_from_mapping(model, wrapper_type, key)
+
+    if callable(getattr(model, "add_wrapper_with_key", None)):
+        model.add_wrapper_with_key(wrapper_type, key, wrapper)
+        return True
+
+    wrappers = getattr(model, "wrappers", None)
+    if isinstance(wrappers, dict):
+        wrappers.setdefault(wrapper_type, {}).setdefault(key, []).append(wrapper)
+        return True
+
+    return False
+
+
+def _register_model_patcher_wrappers(model: Any) -> bool:
+    if _comfy_patcher_extension is not None:
+        wrapper_types = _comfy_patcher_extension.WrappersMP
+        diffusion_type = wrapper_types.DIFFUSION_MODEL
+        apply_type = wrapper_types.APPLY_MODEL
+    else:
+        diffusion_type = _DIFFUSION_MODEL_WRAPPER_TYPE
+        apply_type = _APPLY_MODEL_WRAPPER_TYPE
+
+    installed_diffusion = _replace_model_patcher_wrapper(
+        model,
+        diffusion_type,
+        _DIFFUSION_MODEL_WRAPPER_KEY,
+        _spectrum_wan_diffusion_model_wrapper,
+    )
+    installed_apply = _replace_model_patcher_wrapper(
+        model,
+        apply_type,
+        _APPLY_MODEL_WRAPPER_KEY,
+        _spectrum_wan_apply_model_wrapper,
+    )
+    return bool(installed_diffusion or installed_apply)
 
 
 def _apply_model_transformer_options(args, kwargs):
@@ -423,6 +497,80 @@ def _run_spectrum_forward(
     return out
 
 
+def _spectrum_wan_apply_model_wrapper(
+    executor,
+    x,
+    timestep,
+    c_concat=None,
+    c_crossattn=None,
+    control=None,
+    transformer_options=None,
+    **kwargs,
+):
+    if transformer_options is None:
+        transformer_options = {}
+
+    outer = getattr(executor, "class_obj", None)
+    runtime = _resolve_runtime(transformer_options)
+    if runtime is None and outer is not None:
+        bound_runtime = getattr(outer, "_spectrum_wan_runtime", None)
+        if isinstance(bound_runtime, SpectrumWanRuntime):
+            runtime = bound_runtime
+            transformer_options[_RUNTIME_KEY] = runtime
+
+    if isinstance(runtime, SpectrumWanRuntime) and runtime.cfg.enabled:
+        if not getattr(outer, "_spectrum_wan_apply_wrapper_logged", False):
+            runtime._debug_log("[Spectrum WAN] apply_model wrapper active")
+            if outer is not None:
+                outer._spectrum_wan_apply_wrapper_logged = True
+
+        if _install_diffusion_model_wrapper(transformer_options):
+            runtime.last_info["live_diffusion_wrapper_installed"] = True
+            if not getattr(outer, "_spectrum_wan_live_wrapper_logged", False):
+                runtime._debug_log("[Spectrum WAN] activated live diffusion_model wrapper")
+                if outer is not None:
+                    outer._spectrum_wan_live_wrapper_logged = True
+
+        current_root = getattr(outer, "diffusion_model", None) if outer is not None else None
+        current_inner, current_inner_name = _locate_wan_like_descendant(current_root, "model.diffusion_model")
+        previously_bound_id = getattr(outer, "_spectrum_wan_bound_inner_id", None) if outer is not None else None
+        bound = _bind_runtime_to_inner(current_inner, runtime, current_inner_name)
+        current_inner_id = id(current_inner) if bound else None
+        if outer is not None:
+            outer._spectrum_wan_bound_inner_id = current_inner_id
+
+        if bound and previously_bound_id != current_inner_id:
+            runtime._debug_log(
+                "[Spectrum WAN] rebound live inner "
+                f"path={current_inner_name} "
+                f"type={type(current_inner).__name__} "
+                f"id={current_inner_id}"
+            )
+        elif not bound:
+            runtime.last_info["patched"] = False
+            runtime.last_info["hook_target"] = current_inner_name or "model.diffusion_model"
+            runtime.last_info["live_inner_root_type"] = (
+                type(current_root).__name__ if current_root is not None else None
+            )
+            runtime.last_info.pop("runtime_missing_attrs", None)
+            runtime.last_info.pop("live_inner_type", None)
+            runtime.last_info.pop("live_inner_id", None)
+            runtime._debug_log(
+                "[Spectrum WAN] no WAN-like live inner under "
+                f"root_type={runtime.last_info['live_inner_root_type']}"
+            )
+
+    return executor(
+        x,
+        timestep,
+        c_concat,
+        c_crossattn,
+        control,
+        transformer_options,
+        **kwargs,
+    )
+
+
 def _spectrum_wan_diffusion_model_wrapper(
     executor,
     x,
@@ -655,8 +803,12 @@ class WanSpectrumPatcher:
             "is_moe_expert": handler.is_moe_expert,
         }
         _install_diffusion_model_wrapper(tr_opts)
+        _install_apply_model_wrapper(tr_opts)
+        model_patcher_wrappers_installed = _register_model_patcher_wrappers(patched)
         if cfg.debug:
             print("[Spectrum WAN] installed diffusion_model wrapper", file=sys.stderr, flush=True)
+            if model_patcher_wrappers_installed:
+                print("[Spectrum WAN] installed ModelPatcher wrappers", file=sys.stderr, flush=True)
 
         outer = getattr(patched, "model", None)
         _wrap_outer_apply_model(outer, runtime)
