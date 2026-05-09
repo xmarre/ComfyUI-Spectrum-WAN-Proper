@@ -126,6 +126,37 @@ def test_split_schedule_bias_shift() -> None:
     assert low_refresh["actual_forward"], "bias_shift should preserve the normal scheduler cadence after initialization"
 
 
+def test_completed_high_noise_final_step_is_idempotent_for_orphaned_handoff_cleanup() -> None:
+    high_runtime = _make_runtime("wan22_high_noise", "bias_shift")
+    high_sigmas = torch.tensor([1.0, 0.8, 0.6], dtype=torch.float32)
+    opts = {
+        "sample_sigmas": high_sigmas,
+        "cond_or_uncond": [0, 1],
+        "spectrum_wan_run_token": 707,
+    }
+
+    for step in range(high_sigmas.numel()):
+        decision = high_runtime.begin_step(opts, high_sigmas[step : step + 1])
+        assert decision["step_idx"] == step
+        if decision["actual_forward"]:
+            high_runtime.observe_feature(
+                opts,
+                decision["step_idx"],
+                torch.full((1, 4, 8), float(step + 1), dtype=torch.float32),
+                global_step=decision["global_step"],
+            )
+        high_runtime.end_step(opts, decision["step_idx"])
+
+    orphaned_keys = set(high_runtime._orphaned_handoff_keys)
+    assert len(orphaned_keys) == 1
+
+    final_duplicate = high_runtime.begin_step(opts, high_sigmas[-1:])
+    assert final_duplicate is decision
+    high_runtime.end_step(opts, final_duplicate["step_idx"])
+
+    assert high_runtime._orphaned_handoff_keys == orphaned_keys
+
+
 def test_run_token_mismatch_falls_back() -> None:
     high_runtime = _make_runtime("wan22_high_noise", "bias_shift")
     low_runtime = _make_runtime("wan22_low_noise", "bias_shift")

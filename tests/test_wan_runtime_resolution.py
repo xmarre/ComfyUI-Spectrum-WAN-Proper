@@ -678,6 +678,42 @@ def test_runtime_missing_sample_sigmas_does_not_reuse_previous_schedule_length()
     assert third["actual_forward"] is False
 
 
+def test_runtime_reuses_completed_final_sigma_decision_before_next_cycle_reset() -> None:
+    cfg = SpectrumWanConfig(
+        backend="wan21",
+        warmup_steps=0,
+        window_size=2.0,
+        flex_window=0.75,
+    ).validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.18181819], dtype=torch.float32)
+    transformer_options = {
+        "sample_sigmas": sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
+
+    for step in range(len(sample_sigmas)):
+        decision = runtime.begin_step(transformer_options, sample_sigmas[step : step + 1])
+        assert decision["step_idx"] == step
+        if decision["actual_forward"]:
+            runtime.observe_feature(
+                transformer_options,
+                decision["step_idx"],
+                torch.full((1, 2), float(step + 1), dtype=torch.float32),
+            )
+        runtime.end_step(transformer_options, decision["step_idx"])
+
+    final_duplicate = runtime.begin_step(
+        transformer_options,
+        sample_sigmas[-1:],
+    )
+    assert final_duplicate is decision
+    assert final_duplicate["step_idx"] == 2
+
+    next_cycle = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
+    assert next_cycle["step_idx"] == 0
+
+
 def test_patcher_apply_model_overwrites_stale_runtime_with_current_outer_runtime() -> None:
     patched = WanSpectrumPatcher.patch(DummyModelWithForward(), _cfg())
     current_runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
