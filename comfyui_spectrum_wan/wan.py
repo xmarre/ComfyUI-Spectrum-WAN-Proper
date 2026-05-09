@@ -359,6 +359,235 @@ def _resolve_runtime(
     return None
 
 
+def _can_run_spectrum_diffusion_direct(inner: Any) -> Tuple[bool, Tuple[str, ...]]:
+    missing = list(_spectrum_runtime_missing_attrs(inner))
+    if not callable(getattr(inner, "rope_encode", None)):
+        missing.append("rope_encode")
+    if not hasattr(inner, "patch_size"):
+        missing.append("patch_size")
+    return not missing, tuple(missing)
+
+
+def _spectrum_wan_diffusion_fallback_log(
+    runtime: SpectrumWanRuntime,
+    inner: Any,
+    reason: str,
+    missing: Tuple[str, ...] = (),
+    exc: Optional[BaseException] = None,
+) -> None:
+    if missing:
+        runtime.last_info["runtime_missing_attrs"] = list(missing)
+    if "rope_encode" in missing:
+        runtime.last_info["runtime_missing_rope_encode"] = True
+    if exc is not None:
+        runtime.last_info["diffusion_wrapper_error"] = f"{type(exc).__name__}: {exc}"
+    detail = f"error={type(exc).__name__}: {exc}" if exc is not None else f"missing_attrs={','.join(missing) if missing else '-'}"
+    runtime._debug_log(
+        "[Spectrum WAN] diffusion wrapper fallback "
+        f"reason={reason} "
+        f"inner_type={type(inner).__name__ if inner is not None else None} "
+        f"{detail} "
+        f"has_rope_encode={callable(getattr(inner, 'rope_encode', None)) if inner is not None else False}"
+    )
+
+
+def _run_spectrum_diffusion_model_direct(
+    inner: Any,
+    runtime: SpectrumWanRuntime,
+    x,
+    timestep,
+    context,
+    clip_fea=None,
+    time_dim_concat=None,
+    transformer_options=None,
+    **kwargs,
+):
+    if transformer_options is None:
+        transformer_options = {}
+
+    runnable, missing = _can_run_spectrum_diffusion_direct(inner)
+    if not runnable:
+        _spectrum_wan_diffusion_fallback_log(runtime, inner, "unsupported_inner", missing=missing)
+        return None
+
+    _, _, orig_t, orig_h, orig_w = x.shape
+    padded_x = _pad_to_patch_size(x, inner.patch_size)
+    rope_t = orig_t
+    if time_dim_concat is not None:
+        padded_time_dim_concat = _pad_to_patch_size(time_dim_concat, inner.patch_size)
+        padded_x = torch.cat([padded_x, padded_time_dim_concat], dim=2)
+        rope_t = padded_x.shape[2]
+    if getattr(inner, "ref_conv", None) is not None and "reference_latent" in kwargs:
+        rope_t += 1
+    freqs = inner.rope_encode(
+        rope_t,
+        orig_h,
+        orig_w,
+        device=padded_x.device,
+        dtype=padded_x.dtype,
+        transformer_options=transformer_options,
+    )
+    out = _run_spectrum_forward(
+        inner,
+        runtime,
+        padded_x,
+        timestep,
+        context,
+        clip_fea=clip_fea,
+        freqs=freqs,
+        transformer_options=transformer_options,
+        **kwargs,
+    )
+    return out[:, :, :orig_t, :orig_h, :orig_w]
+
+
+def _cast_to_device(value: Any, device, dtype):
+    try:
+        import comfy.model_management as model_management
+    except ModuleNotFoundError as exc:  # pragma: no cover - ComfyUI is unavailable in unit tests.
+        if not (exc.name and exc.name.startswith("comfy")):
+            raise
+        model_management = None
+
+    if model_management is not None:
+        cast_dtype = None if getattr(value, "dtype", None) in (torch.int, torch.long) else dtype
+        return model_management.cast_to_device(value, device, cast_dtype)
+
+    if hasattr(value, "to"):
+        if getattr(value, "dtype", None) in (torch.int, torch.long):
+            return value.to(device=device)
+        return value.to(device=device, dtype=dtype)
+    return value
+
+
+def _convert_extra_cond(extra: Any, device, dtype):
+    if hasattr(extra, "dtype"):
+        return _cast_to_device(extra, device, dtype)
+    if isinstance(extra, list):
+        return [_convert_extra_cond(item, device, dtype) for item in extra]
+    return extra
+
+
+def _comfy_latent_utils():
+    candidates = []
+    try:
+        import comfy.ldm.common_dit as common_dit
+        candidates.append(common_dit)
+    except ModuleNotFoundError as exc:  # pragma: no cover - ComfyUI is unavailable in unit tests.
+        if not (exc.name and exc.name.startswith("comfy")):
+            raise
+    try:
+        import comfy.utils as comfy_utils
+        candidates.append(comfy_utils)
+    except ModuleNotFoundError as exc:  # pragma: no cover - ComfyUI is unavailable in unit tests.
+        if not (exc.name and exc.name.startswith("comfy")):
+            raise
+    return candidates
+
+
+def _try_unpack_latents(x, extra_conds: Dict[str, Any]):
+    if "latent_shapes" not in extra_conds:
+        return x, False
+    for utils_mod in _comfy_latent_utils():
+        unpack = getattr(utils_mod, "unpack_latents", None)
+        if callable(unpack):
+            return unpack(x, extra_conds.pop("latent_shapes")), True
+    return x, False
+
+
+def _try_pack_latents(model_output, was_unpacked: bool):
+    if not was_unpacked or torch.is_tensor(model_output):
+        return model_output
+    try:
+        if len(model_output) <= 1:
+            return model_output
+    except TypeError:
+        return model_output
+    for utils_mod in _comfy_latent_utils():
+        pack = getattr(utils_mod, "pack_latents", None)
+        if callable(pack):
+            packed = pack(model_output)
+            if isinstance(packed, tuple):
+                return packed[0] if packed else model_output
+            return packed
+    return model_output
+
+
+def _run_spectrum_from_apply_model_direct(
+    outer: Any,
+    inner: Any,
+    runtime: SpectrumWanRuntime,
+    x,
+    timestep,
+    c_concat=None,
+    c_crossattn=None,
+    control=None,
+    transformer_options=None,
+    **kwargs,
+):
+    if transformer_options is None:
+        transformer_options = {}
+
+    if control is not None:
+        runtime.last_info["apply_direct_skipped"] = "control"
+        return None
+    if not all(callable(getattr(outer, attr, None)) for attr in ("get_dtype_inference", "process_timestep")):
+        runtime.last_info["apply_direct_skipped"] = "outer_api"
+        return None
+    model_sampling = getattr(outer, "model_sampling", None)
+    if not all(callable(getattr(model_sampling, attr, None)) for attr in ("calculate_input", "timestep", "calculate_denoised")):
+        runtime.last_info["apply_direct_skipped"] = "model_sampling_api"
+        return None
+
+    try:
+        sigma = timestep
+        xc = model_sampling.calculate_input(sigma, x)
+        dtype = outer.get_dtype_inference()
+        if c_concat is not None:
+            xc = torch.cat([xc, _cast_to_device(c_concat, xc.device, xc.dtype)], dim=1)
+        context = c_crossattn
+        xc = xc.to(dtype)
+        device = xc.device
+        t = model_sampling.timestep(timestep).float()
+        if context is not None:
+            context = _cast_to_device(context, device, dtype)
+
+        extra_conds = {key: _convert_extra_cond(value, device, dtype) for key, value in kwargs.items()}
+        t = outer.process_timestep(t, x=x, **extra_conds)
+        xc, was_unpacked = _try_unpack_latents(xc, extra_conds)
+
+        direct_options = transformer_options.copy()
+        direct_options[_RUNTIME_KEY] = runtime
+        direct_options["prefetch_dynamic_vbars"] = (
+            getattr(outer, "current_patcher", None) is not None
+            and callable(getattr(outer.current_patcher, "is_dynamic", None))
+            and outer.current_patcher.is_dynamic()
+        )
+
+        model_output = _run_spectrum_diffusion_model_direct(
+            inner,
+            runtime,
+            xc,
+            t,
+            context,
+            transformer_options=direct_options,
+            **extra_conds,
+        )
+        if model_output is None:
+            return None
+        model_output = _try_pack_latents(model_output, was_unpacked)
+        return model_sampling.calculate_denoised(sigma, model_output.float(), x)
+    except Exception as exc:
+        runtime.last_info["apply_direct_error"] = f"{type(exc).__name__}: {exc}"
+        runtime._debug_log(
+            "[Spectrum WAN] apply_model direct fallback "
+            f"inner_type={type(inner).__name__ if inner is not None else None} "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        runtime.reset_all()
+        return None
+
+
 def _run_spectrum_forward(
     inner: Any,
     runtime: SpectrumWanRuntime,
@@ -560,6 +789,30 @@ def _spectrum_wan_apply_model_wrapper(
                 f"root_type={runtime.last_info['live_inner_root_type']}"
             )
 
+        # WAN 2.1 can bypass the WanModel diffusion wrapper path entirely in some
+        # ComfyUI loader stacks. WAN 2.2 already works through the lower-level hook,
+        # so keep the apply-level short-circuit scoped to WAN 2.1 to avoid
+        # bypassing unrelated apply_model wrappers for working backends.
+        if bound and runtime.handler.backend_id == "wan21":
+            direct_out = _run_spectrum_from_apply_model_direct(
+                outer,
+                current_inner,
+                runtime,
+                x,
+                timestep,
+                c_concat=c_concat,
+                c_crossattn=c_crossattn,
+                control=control,
+                transformer_options=transformer_options,
+                **kwargs,
+            )
+            if direct_out is not None:
+                if not getattr(outer, "_spectrum_wan_apply_direct_logged", False):
+                    runtime._debug_log("[Spectrum WAN] apply_model direct path active")
+                    if outer is not None:
+                        outer._spectrum_wan_apply_direct_logged = True
+                return direct_out
+
     return executor(
         x,
         timestep,
@@ -603,18 +856,20 @@ def _spectrum_wan_diffusion_model_wrapper(
             **kwargs,
         )
 
-    missing = _spectrum_runtime_missing_attrs(inner)
-    if missing or not callable(getattr(inner, "rope_encode", None)) or not hasattr(inner, "patch_size"):
-        if missing:
-            runtime.last_info["runtime_missing_attrs"] = list(missing)
-        if not callable(getattr(inner, "rope_encode", None)):
-            runtime.last_info["runtime_missing_rope_encode"] = True
-        runtime._debug_log(
-            "[Spectrum WAN] diffusion wrapper fallback "
-            f"inner_type={type(inner).__name__} "
-            f"missing_attrs={','.join(missing) if missing else '-'} "
-            f"has_rope_encode={callable(getattr(inner, 'rope_encode', None))}"
+    try:
+        out = _run_spectrum_diffusion_model_direct(
+            inner,
+            runtime,
+            x,
+            timestep,
+            context,
+            clip_fea=clip_fea,
+            time_dim_concat=time_dim_concat,
+            transformer_options=transformer_options,
+            **kwargs,
         )
+        if out is not None:
+            return out
         return executor(
             x,
             timestep,
@@ -624,44 +879,8 @@ def _spectrum_wan_diffusion_model_wrapper(
             transformer_options,
             **kwargs,
         )
-
-    try:
-        _, _, orig_t, orig_h, orig_w = x.shape
-        padded_x = _pad_to_patch_size(x, inner.patch_size)
-        rope_t = orig_t
-        if time_dim_concat is not None:
-            padded_time_dim_concat = _pad_to_patch_size(time_dim_concat, inner.patch_size)
-            padded_x = torch.cat([padded_x, padded_time_dim_concat], dim=2)
-            rope_t = padded_x.shape[2]
-        if getattr(inner, "ref_conv", None) is not None and "reference_latent" in kwargs:
-            rope_t += 1
-        freqs = inner.rope_encode(
-            rope_t,
-            orig_h,
-            orig_w,
-            device=padded_x.device,
-            dtype=padded_x.dtype,
-            transformer_options=transformer_options,
-        )
-        out = _run_spectrum_forward(
-            inner,
-            runtime,
-            padded_x,
-            timestep,
-            context,
-            clip_fea=clip_fea,
-            freqs=freqs,
-            transformer_options=transformer_options,
-            **kwargs,
-        )
-        return out[:, :, :orig_t, :orig_h, :orig_w]
     except Exception as exc:
-        runtime.last_info["diffusion_wrapper_error"] = f"{type(exc).__name__}: {exc}"
-        runtime._debug_log(
-            "[Spectrum WAN] diffusion wrapper fallback "
-            f"inner_type={type(inner).__name__} "
-            f"error={type(exc).__name__}: {exc}"
-        )
+        _spectrum_wan_diffusion_fallback_log(runtime, inner, "direct_error", exc=exc)
         runtime.reset_all()
         return executor(
             x,
