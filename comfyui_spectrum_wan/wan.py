@@ -449,6 +449,10 @@ def _wrap_wan__forward_passthrough(inner: Any) -> None:
     ):
         if transformer_options is None:
             transformer_options = {}
+        if isinstance(transformer_options, dict) and _RUNTIME_KEY not in transformer_options:
+            current_runtime = getattr(inner, "_spectrum_wan_runtime", None)
+            if isinstance(current_runtime, SpectrumWanRuntime):
+                transformer_options[_RUNTIME_KEY] = current_runtime
         return original__forward(
             x,
             timestep,

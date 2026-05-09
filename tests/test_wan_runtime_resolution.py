@@ -585,6 +585,51 @@ def test_patcher__forward_passthrough_preserves_current_transformer_runtime() ->
     assert inner.seen_transformer_options[_RUNTIME_KEY] is stale_runtime
 
 
+def test_patcher__forward_passthrough_injects_bound_runtime_when_missing() -> None:
+    patched = WanSpectrumPatcher.patch(DummyModelWithForward(), _cfg())
+    inner = patched.model.diffusion_model
+    current_runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+
+    transformer_options = {"cond_or_uncond": [0, 1]}
+
+    inner._forward(
+        torch.ones((1, 1, 2, 2), dtype=torch.float32),
+        torch.tensor([1.0], dtype=torch.float32),
+        torch.zeros((1, 1, 1), dtype=torch.float32),
+        transformer_options=transformer_options,
+    )
+
+    assert inner.seen_transformer_options is transformer_options
+    assert inner.seen_transformer_options[_RUNTIME_KEY] is current_runtime
+
+
+def test_runtime_accumulates_history_when_sample_sigmas_are_missing() -> None:
+    cfg = SpectrumWanConfig(
+        backend="wan21",
+        warmup_steps=0,
+        window_size=2.0,
+        flex_window=0.75,
+    ).validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
+    transformer_options = {"cond_or_uncond": [0, 1]}
+
+    first = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
+    assert first["step_idx"] == 0
+    assert first["actual_forward"] is True
+    runtime.observe_feature(transformer_options, first["step_idx"], torch.ones((1, 2), dtype=torch.float32))
+    runtime.end_step(transformer_options, first["step_idx"])
+
+    second = runtime.begin_step(transformer_options, torch.tensor([0.8], dtype=torch.float32))
+    assert second["step_idx"] == 1
+    assert second["actual_forward"] is True
+    runtime.observe_feature(transformer_options, second["step_idx"], torch.full((1, 2), 2.0, dtype=torch.float32))
+    runtime.end_step(transformer_options, second["step_idx"])
+
+    third = runtime.begin_step(transformer_options, torch.tensor([0.6], dtype=torch.float32))
+    assert third["step_idx"] == 2
+    assert third["actual_forward"] is False
+
+
 def test_patcher_apply_model_overwrites_stale_runtime_with_current_outer_runtime() -> None:
     patched = WanSpectrumPatcher.patch(DummyModelWithForward(), _cfg())
     current_runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
