@@ -419,10 +419,11 @@ def _run_spectrum_diffusion_model_direct(
         rope_t = padded_x.shape[2]
     if getattr(inner, "ref_conv", None) is not None and "reference_latent" in kwargs:
         rope_t += 1
+    _, _, _, padded_h, padded_w = padded_x.shape
     freqs = inner.rope_encode(
         rope_t,
-        orig_h,
-        orig_w,
+        padded_h,
+        padded_w,
         device=padded_x.device,
         dtype=padded_x.dtype,
         transformer_options=transformer_options,
@@ -450,11 +451,13 @@ def _cast_to_device(value: Any, device, dtype):
         model_management = None
 
     if model_management is not None:
-        cast_dtype = None if getattr(value, "dtype", None) in (torch.int, torch.long) else dtype
+        value_dtype = getattr(value, "dtype", None)
+        cast_dtype = None if value_dtype is not None and not getattr(value_dtype, "is_floating_point", True) else dtype
         return model_management.cast_to_device(value, device, cast_dtype)
 
     if hasattr(value, "to"):
-        if getattr(value, "dtype", None) in (torch.int, torch.long):
+        value_dtype = getattr(value, "dtype", None)
+        if value_dtype is not None and not getattr(value_dtype, "is_floating_point", True):
             return value.to(device=device)
         return value.to(device=device, dtype=dtype)
     return value
