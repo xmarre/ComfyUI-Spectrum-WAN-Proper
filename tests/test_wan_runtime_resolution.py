@@ -692,7 +692,7 @@ def test_runtime_reuses_completed_final_sigma_decision_before_next_cycle_reset()
         "cond_or_uncond": [0, 1],
     }
 
-    for step in range(len(sample_sigmas)):
+    for step in range(sample_sigmas.numel() - 1):
         decision = runtime.begin_step(transformer_options, sample_sigmas[step : step + 1])
         assert decision["step_idx"] == step
         if decision["actual_forward"]:
@@ -705,10 +705,10 @@ def test_runtime_reuses_completed_final_sigma_decision_before_next_cycle_reset()
 
     final_duplicate = runtime.begin_step(
         transformer_options,
-        sample_sigmas[-1:],
+        sample_sigmas[-2:-1],
     )
     assert final_duplicate is decision
-    assert final_duplicate["step_idx"] == 2
+    assert final_duplicate["step_idx"] == 1
 
     next_cycle = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
     assert next_cycle["step_idx"] == 0

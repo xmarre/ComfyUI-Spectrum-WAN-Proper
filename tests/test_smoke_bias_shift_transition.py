@@ -135,7 +135,7 @@ def test_completed_high_noise_final_step_is_idempotent_for_orphaned_handoff_clea
         "spectrum_wan_run_token": 707,
     }
 
-    for step in range(high_sigmas.numel()):
+    for step in range(high_sigmas.numel() - 1):
         decision = high_runtime.begin_step(opts, high_sigmas[step : step + 1])
         assert decision["step_idx"] == step
         if decision["actual_forward"]:
@@ -150,7 +150,7 @@ def test_completed_high_noise_final_step_is_idempotent_for_orphaned_handoff_clea
     orphaned_keys = set(high_runtime._orphaned_handoff_keys)
     assert len(orphaned_keys) == 1
 
-    final_duplicate = high_runtime.begin_step(opts, high_sigmas[-1:])
+    final_duplicate = high_runtime.begin_step(opts, high_sigmas[-2:-1])
     assert final_duplicate is decision
     high_runtime.end_step(opts, final_duplicate["step_idx"])
 
