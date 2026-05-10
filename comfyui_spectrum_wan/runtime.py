@@ -418,19 +418,17 @@ class SpectrumWanRuntime:
         stream = self.streams.get(key)
         if stream is None:
             return
-        if self._should_publish_bias_shift_handoff() and stream.run_token is not None:
+        already_finished = bool(stream.cycle_finished)
+        if not already_finished and self._should_publish_bias_shift_handoff() and stream.run_token is not None:
             handoff_key = (int(stream.run_token), key[1], _HIGH_TO_LOW_DIRECTION)
             self._orphaned_handoff_keys.add(handoff_key)
 
-        # The final output for this stream has already been produced.
-        # At this point, run-scoped forecasting state should be released so
-        # downstream stages (e.g. VAE decode / cleanup nodes) do not inherit
-        # large retained tensors from the finished sampler.
-        stream.reset()
-
-        # Drop the stream object entirely so its forecaster/history tensors are
-        # not kept alive by the runtime mapping after the cycle is complete.
-        self.streams.pop(key, None)
+        # Do not immediately reset/pop the stream here. WAN 2.1 can perform a
+        # duplicate model call at the completed final sigma. If we clear state
+        # at end_step(), that duplicate call is misclassified as a new step 0.
+        # Mark completion and let begin_step() reset only when the next call
+        # moves away from the final sigma or starts a new cycle.
+        stream.cycle_finished = True
 
         self._clear_transient_last_info()
         self.last_info["run_id"] = self.run_id
@@ -555,9 +553,17 @@ class SpectrumWanRuntime:
         self.last_info["last_sigma"] = sigma
 
         known_num_steps = self._known_num_steps(transformer_options)
-        if known_num_steps is not None and len(stream.seen_sigmas) >= known_num_steps and not stream.cycle_finished:
+        if known_num_steps is not None and len(stream.seen_sigmas) >= known_num_steps:
             stream.cycle_finished = True
         if stream.cycle_finished:
+            # Some WAN/Comfy sampler paths issue a duplicate model call at the
+            # final sigma after the sampler has already produced the last
+            # visible step. Reuse the completed stream's final decision for
+            # that duplicate call instead of resetting and treating it as a
+            # new step-0 run. A new cycle still resets below when the sigma
+            # changes away from the completed final sigma.
+            if stream.seen_sigmas and sigma == stream.seen_sigmas[-1] and sigma in stream.decisions_by_sigma:
+                return stream.decisions_by_sigma[sigma]
             stream.reset()
         if stream.seen_sigmas and sigma == stream.seen_sigmas[0] and len(stream.seen_sigmas) > 1:
             stream.reset()
