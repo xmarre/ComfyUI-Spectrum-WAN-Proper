@@ -630,6 +630,61 @@ def test_runtime_accumulates_history_when_sample_sigmas_are_missing() -> None:
     assert third["actual_forward"] is False
 
 
+def test_runtime_tail_actual_steps_force_known_schedule_tail_real() -> None:
+    cfg = SpectrumWanConfig(
+        backend="wan21",
+        warmup_steps=0,
+        window_size=2.0,
+        flex_window=0.75,
+        history_size=8,
+        tail_actual_steps=2,
+    ).validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
+    sample_sigmas = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
+    transformer_options = {
+        "sample_sigmas": sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
+
+    decisions = []
+    for step in range(sample_sigmas.numel() - 1):
+        decision = runtime.begin_step(transformer_options, sample_sigmas[step : step + 1])
+        decisions.append(decision)
+        if decision["actual_forward"]:
+            runtime.observe_feature(
+                transformer_options,
+                decision["step_idx"],
+                torch.full((1, 2), float(step + 1), dtype=torch.float32),
+            )
+        runtime.end_step(transformer_options, decision["step_idx"])
+
+    assert [d["actual_forward"] for d in decisions] == [True, True, False, True, True]
+
+
+def test_runtime_tail_actual_steps_ignored_without_known_schedule_length() -> None:
+    cfg = SpectrumWanConfig(
+        backend="wan21",
+        warmup_steps=0,
+        window_size=2.0,
+        flex_window=0.75,
+        history_size=8,
+        tail_actual_steps=3,
+    ).validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
+    transformer_options = {"cond_or_uncond": [0, 1]}
+
+    first = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
+    runtime.observe_feature(transformer_options, first["step_idx"], torch.ones((1, 2), dtype=torch.float32))
+    runtime.end_step(transformer_options, first["step_idx"])
+
+    second = runtime.begin_step(transformer_options, torch.tensor([0.8], dtype=torch.float32))
+    runtime.observe_feature(transformer_options, second["step_idx"], torch.full((1, 2), 2.0, dtype=torch.float32))
+    runtime.end_step(transformer_options, second["step_idx"])
+
+    third = runtime.begin_step(transformer_options, torch.tensor([0.6], dtype=torch.float32))
+    assert third["actual_forward"] is False
+
+
 def test_runtime_missing_sample_sigmas_does_not_reuse_previous_schedule_length() -> None:
     cfg = SpectrumWanConfig(
         backend="wan21",
@@ -684,6 +739,7 @@ def test_runtime_reuses_completed_final_sigma_decision_before_next_cycle_reset()
         warmup_steps=0,
         window_size=2.0,
         flex_window=0.75,
+        tail_actual_steps=0,
     ).validated()
     runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
     sample_sigmas = torch.tensor([1.0, 0.5, 0.18181819], dtype=torch.float32)

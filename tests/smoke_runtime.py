@@ -28,6 +28,7 @@ def main() -> None:
         flex_window=0.75,
         warmup_steps=2,
         history_size=8,
+        tail_actual_steps=0,
     ).validated()
     handler = resolve_handler(cfg.backend, DummyModel())
     runtime = SpectrumWanRuntime(cfg, handler)

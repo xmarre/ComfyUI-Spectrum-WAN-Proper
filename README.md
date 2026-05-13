@@ -82,6 +82,7 @@ No additional dependencies are required beyond normal ComfyUI requirements.
 - `flex_window` — amount added to the window after each actual forward
 - `warmup_steps` — number of initial actual forwards
 - `history_size` — number of actual WAN features to retain for fitting
+- `tail_actual_steps` — number of final known-schedule solver steps forced to stay on the actual WAN path
 - `forecaster_cache_mode` — Chebyshev cache implementation mode
   - `legacy_dense_coeff` — default; preserves the original dense coefficient cache path
   - `low_vram_exact` — opt-in exact low-VRAM mode; avoids the dense coefficient cache and applies equivalent history weights chunk-by-chunk at prediction time
@@ -103,6 +104,7 @@ window_size = 2.0
 flex_window = 0.75
 warmup_steps = 5
 history_size = 16
+tail_actual_steps = 1
 transition_mode = separate_fit
 forecaster_cache_mode = legacy_dense_coeff
 ```
@@ -112,6 +114,12 @@ forecaster_cache_mode = legacy_dense_coeff
 The official reference implementation uses a large history cap, but the recommended adaptive WAN settings in the paper consume only **14** or **10** actual network evaluations in the important regimes. A history cap of `16` therefore preserves all actual points in those standard settings while materially reducing memory pressure for WAN video features.
 
 That is an explicit practical approximation in this repo.
+
+### Why `tail_actual_steps = 1`?
+
+`tail_actual_steps` reserves the final known-schedule solver steps for real WAN forwards instead of forecasted features. This mirrors the FLUX Spectrum node's tail guard and protects the refinement tail, where forecast bias is most likely to appear as softened microdetail or late-step texture drift.
+
+The guard is only applied when ComfyUI exposes a known schedule length through `sample_sigmas`. When a sampler path does not expose that length, WAN keeps the previous moving lower-bound behavior and does not treat the current lower-bound estimate as the real final tail.
 
 ### Forecaster cache modes
 
@@ -228,7 +236,7 @@ Any custom node that depends on **executing internal WAN blocks on every step** 
 
 ### Memory pressure
 
-Even with final-block-only caching, WAN video features are large. `history_size`, frame count, resolution, hidden width, and `forecaster_cache_mode` all affect VRAM pressure.
+Even with final-block-only caching, WAN video features are large. `history_size`, `tail_actual_steps`, frame count, resolution, hidden width, and `forecaster_cache_mode` all affect VRAM pressure and speedup.
 
 `low_vram_exact` reduces the avoidable VRAM overhead from the dense Chebyshev coefficient cache, but it does **not** remove the core working-set cost of GPU-resident feature history and chunked prediction buffers.
 
@@ -237,7 +245,8 @@ Even with final-block-only caching, WAN video features are large. `history_size`
 This repo is faithful to the core method, but makes two explicit practical adaptations:
 
 1. `history_size = 16` by default instead of keeping a much larger history cap.
-2. The adaptive schedule follows the **practical official implementation behavior** used by public Spectrum code (`window_size` + `flex_window`) rather than exposing the paper’s triangular-step formula directly as the user-facing control surface.
+2. `tail_actual_steps = 1` by default to keep the final known-schedule refinement step on the actual path.
+3. The adaptive schedule follows the **practical official implementation behavior** used by public Spectrum code (`window_size` + `flex_window`) rather than exposing the paper’s triangular-step formula directly as the user-facing control surface.
 
 ### Future ComfyUI changes
 
