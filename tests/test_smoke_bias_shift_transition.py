@@ -46,6 +46,7 @@ def _cfg(backend: str, transition_mode: str) -> SpectrumWanConfig:
         flex_window=0.75,
         warmup_steps=0,
         history_size=8,
+        tail_actual_steps=0,
     ).validated()
 
 

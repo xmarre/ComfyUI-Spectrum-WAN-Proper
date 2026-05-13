@@ -405,6 +405,13 @@ class SpectrumWanRuntime:
         # handled by the next-cycle sigma reset in begin_step().
         return max(observed_steps + 1, 2)
 
+    def _is_tail_actual_step(self, step_idx: int, known_num_steps: Optional[int]) -> bool:
+        tail_actual_steps = int(self.cfg.tail_actual_steps)
+        if tail_actual_steps <= 0 or known_num_steps is None:
+            return False
+        tail_start = max(0, int(known_num_steps) - tail_actual_steps)
+        return int(step_idx) >= tail_start
+
     def end_step(self, transformer_options: Dict[str, Any], step_idx: int) -> None:
         known_num_steps = self._known_num_steps(transformer_options)
         if known_num_steps is None:
@@ -591,14 +598,18 @@ class SpectrumWanRuntime:
         stream.last_processed_global_step = int(global_step)
         transformer_options[_GLOBAL_STEP_KEY] = int(global_step)
 
-        if step_idx >= self.cfg.warmup_steps:
+        tail_actual_only = self._is_tail_actual_step(step_idx, known_num_steps)
+
+        if not tail_actual_only and step_idx >= self.cfg.warmup_steps:
             actual_forward = (
                 (stream.num_consecutive_cached_steps + 1)
                 % max(1, math.floor(stream.curr_ws))
             ) == 0
 
         has_ready_transfer = stream.bias_shift_predictor is not None and stream.bias_shift_predictor.ready()
-        if stream.bias_shift_predictor is not None and not stream.bias_shift_predictor.ready():
+        if tail_actual_only:
+            actual_forward = True
+        elif stream.bias_shift_predictor is not None and not stream.bias_shift_predictor.ready():
             actual_forward = True
         elif not has_ready_transfer:
             assert stream.forecaster is not None

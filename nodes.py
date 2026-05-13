@@ -43,6 +43,7 @@ class SpectrumApplyWAN:
                     ],
                     {"default": "legacy_dense_coeff"},
                 ),
+                "tail_actual_steps": ("INT", {"default": 1, "min": 0, "max": 64, "step": 1}),
             }
         }
 
@@ -66,6 +67,7 @@ class SpectrumApplyWAN:
         history_size,
         debug,
         forecaster_cache_mode,
+        tail_actual_steps,
     ):
         if not enabled:
             return (model,)
@@ -83,6 +85,7 @@ class SpectrumApplyWAN:
             history_size=history_size,
             debug=debug,
             forecaster_cache_mode=forecaster_cache_mode,
+            tail_actual_steps=tail_actual_steps,
         ).validated()
         return (WanSpectrumPatcher.patch(model, cfg),)
 

@@ -43,6 +43,7 @@ class SpectrumWanConfig:
     flex_window: float = 0.75
     warmup_steps: int = 5
     history_size: int = 16
+    tail_actual_steps: int = 1
     fit_chunk_size: int = 1_000_000
     debug: bool = False
     forecaster_cache_mode: str = "legacy_dense_coeff"
@@ -71,6 +72,8 @@ class SpectrumWanConfig:
             raise ValueError("warmup_steps must be >= 0.")
         if int(self.history_size) < 2:
             raise ValueError("history_size must be >= 2.")
+        if int(self.tail_actual_steps) < 0:
+            raise ValueError("tail_actual_steps must be >= 0.")
         if int(self.fit_chunk_size) < 1:
             raise ValueError("fit_chunk_size must be >= 1.")
         if self.forecaster_cache_mode not in _VALID_FORECASTER_CACHE_MODES:
