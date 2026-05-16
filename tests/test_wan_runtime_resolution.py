@@ -690,7 +690,8 @@ def test_runtime_observe_feature_skips_duplicate_completed_step() -> None:
 def test_runtime_warns_when_known_schedule_has_no_forecasted_steps() -> None:
     cfg = SpectrumWanConfig(
         backend="wan21",
-        warmup_steps=5,
+        warmup_steps=2,
+        tail_actual_steps=0,
         debug=True,
     ).validated()
     runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
@@ -714,6 +715,26 @@ def test_runtime_warns_when_known_schedule_has_no_forecasted_steps() -> None:
         "Spectrum WAN: no forecasted steps occurred. "
         "warmup_steps/tail_actual_steps/window_size prevented acceleration."
     )
+
+    next_sample_sigmas = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.0], dtype=torch.float32)
+    next_options = {
+        "sample_sigmas": next_sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
+    for step in range(next_sample_sigmas.numel() - 1):
+        decision = runtime.begin_step(next_options, next_sample_sigmas[step : step + 1])
+        if decision["actual_forward"]:
+            runtime.observe_feature(
+                next_options,
+                decision["step_idx"],
+                torch.full((1, 2), float(step + 1), dtype=torch.float32),
+            )
+            runtime.finalize_step(next_options, decision, actual_taken=True, forecast_taken=False)
+        else:
+            runtime.finalize_step(next_options, decision, actual_taken=False, forecast_taken=True)
+        runtime.end_step(next_options, decision["step_idx"])
+
+    assert "no_forecast_warning" not in runtime.last_info
 
 
 def test_runtime_disables_forecast_when_sample_sigmas_are_missing() -> None:

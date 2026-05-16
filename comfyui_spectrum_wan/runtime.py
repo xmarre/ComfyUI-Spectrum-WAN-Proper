@@ -249,6 +249,7 @@ class SpectrumWanRuntime:
             "schedule_signature_error",
             "sigma_key_source",
             "sigma_key_error",
+            "no_forecast_warning",
         )
         for key in transient_keys:
             self.last_info.pop(key, None)
@@ -434,13 +435,12 @@ class SpectrumWanRuntime:
         if not already_finished and self._should_publish_bias_shift_handoff() and stream.run_token is not None:
             handoff_key = (int(stream.run_token), key[1], _HIGH_TO_LOW_DIRECTION)
             self._orphaned_handoff_keys.add(handoff_key)
+        no_forecast_warning = None
         if not already_finished and self.cfg.debug and stream.forecasted_passes <= 0:
-            message = (
+            no_forecast_warning = (
                 "Spectrum WAN: no forecasted steps occurred. "
                 "warmup_steps/tail_actual_steps/window_size prevented acceleration."
             )
-            self.last_info["no_forecast_warning"] = message
-            self._debug_log(f"[Spectrum WAN] {message}")
 
         # Do not immediately reset/pop the stream here. WAN 2.1 can perform a
         # duplicate model call at the completed final sigma. If we clear state
@@ -454,6 +454,9 @@ class SpectrumWanRuntime:
         self.last_info["num_steps"] = final_num_steps
         self.last_info["handler"] = handler_metadata(self.handler)
         self.last_info["config"] = asdict(self.cfg)
+        if no_forecast_warning is not None:
+            self.last_info["no_forecast_warning"] = no_forecast_warning
+            self._debug_log(f"[Spectrum WAN] {no_forecast_warning}")
 
     def sigma_key(self, transformer_options: Dict[str, Any], timesteps: torch.Tensor) -> float:
         sigmas = transformer_options.get("sigmas", None)
