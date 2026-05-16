@@ -684,19 +684,22 @@ class SpectrumWanRuntime:
         stream = self._stream(transformer_options)
         step_idx = int(decision["step_idx"])
         requested_actual = bool(decision.get("actual_forward_requested", decision.get("actual_forward", True)))
+        schedule_known = bool(decision.get("schedule_known", True))
         if actual_taken:
-            if requested_actual and step_idx >= self.cfg.warmup_steps:
-                stream.curr_ws = round(stream.curr_ws + float(self.cfg.flex_window), 3)
-            stream.num_consecutive_cached_steps = 0
-            stream.actual_forward_count += 1
+            if schedule_known:
+                if requested_actual and step_idx >= self.cfg.warmup_steps:
+                    stream.curr_ws = round(stream.curr_ws + float(self.cfg.flex_window), 3)
+                stream.num_consecutive_cached_steps = 0
+                stream.actual_forward_count += 1
             decision["actual_forward"] = True
-            if not requested_actual:
+            if schedule_known and not requested_actual:
                 decision["actual_fallback"] = True
         else:
-            stream.num_consecutive_cached_steps += 1
-            stream.forecasted_passes += 1
+            if schedule_known:
+                stream.num_consecutive_cached_steps += 1
+                stream.forecasted_passes += 1
             decision["actual_forward"] = False
-            if self._should_publish_bias_shift_handoff():
+            if schedule_known and self._should_publish_bias_shift_handoff():
                 self._publish_bias_shift_handoff(transformer_options, stream)
 
         decision["forecast_taken"] = bool(forecast_taken)
@@ -711,6 +714,8 @@ class SpectrumWanRuntime:
         global_step: Optional[int] = None,
     ) -> None:
         stream = self._stream(transformer_options)
+        if not bool(transformer_options.get("spectrum_wan_schedule_known", True)):
+            return
         observed_key = (int(self.run_id), int(step_idx))
         if observed_key in stream.observed_step_keys:
             return

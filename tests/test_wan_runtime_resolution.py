@@ -687,6 +687,54 @@ def test_runtime_observe_feature_skips_duplicate_completed_step() -> None:
     assert torch.equal(stream.forecaster.history[0][1], torch.ones((1, 2), dtype=torch.float32))
 
 
+def test_runtime_observe_feature_ignores_unknown_schedule_before_dedupe() -> None:
+    cfg = SpectrumWanConfig(backend="wan21").validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
+    transformer_options = {"cond_or_uncond": [0, 1]}
+
+    unknown = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
+    runtime.observe_feature(transformer_options, unknown["step_idx"], torch.ones((1, 2), dtype=torch.float32))
+
+    stream = runtime._stream(transformer_options)
+    assert stream.forecaster is not None
+    assert stream.forecaster.history == []
+    assert stream.observed_step_keys == set()
+
+    scheduled_options = {
+        "sample_sigmas": torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32),
+        "cond_or_uncond": [0, 1],
+    }
+    runtime.begin_step(scheduled_options, torch.tensor([1.0], dtype=torch.float32))
+    runtime.observe_feature(scheduled_options, 0, torch.full((1, 2), 2.0, dtype=torch.float32))
+
+    scheduled_stream = runtime._stream(scheduled_options)
+    assert scheduled_stream.forecaster is not None
+    assert len(scheduled_stream.forecaster.history) == 1
+    assert torch.equal(scheduled_stream.forecaster.history[0][1], torch.full((1, 2), 2.0, dtype=torch.float32))
+
+
+def test_runtime_unknown_schedule_forecast_finalization_does_not_publish_or_count() -> None:
+    cfg = SpectrumWanConfig(
+        backend="wan22_high_noise",
+        transition_mode="bias_shift",
+    ).validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan22_high_noise", DummyModel()))
+    transformer_options = {"cond_or_uncond": [0, 1]}
+    decision = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
+    stream = runtime._stream(transformer_options)
+
+    decision["actual_forward_requested"] = False
+    decision["actual_forward"] = False
+    runtime.finalize_step(transformer_options, decision, actual_taken=False, forecast_taken=True)
+
+    assert decision["outcome_finalized"] is True
+    assert decision["forecast_taken"] is True
+    assert stream.forecasted_passes == 0
+    assert stream.num_consecutive_cached_steps == 0
+    assert stream.actual_forward_count == 0
+    assert stream.actual_history == []
+
+
 def test_runtime_warns_when_known_schedule_has_no_forecasted_steps() -> None:
     cfg = SpectrumWanConfig(
         backend="wan21",
@@ -746,6 +794,8 @@ def test_runtime_disables_forecast_when_sample_sigmas_are_missing() -> None:
     ).validated()
     runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
     transformer_options = {"cond_or_uncond": [0, 1]}
+    stream = runtime._stream(transformer_options)
+    initial_curr_ws = stream.curr_ws
 
     first = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
     assert first["step_idx"] == 0
@@ -765,6 +815,12 @@ def test_runtime_disables_forecast_when_sample_sigmas_are_missing() -> None:
     assert third["step_idx"] == 2
     assert third["actual_forward"] is True
     assert third["schedule_known"] is False
+    assert stream.curr_ws == initial_curr_ws
+    assert stream.actual_forward_count == 0
+    assert stream.forecasted_passes == 0
+    assert stream.num_consecutive_cached_steps == 0
+    assert stream.forecaster is not None
+    assert stream.forecaster.history == []
 
 
 def test_runtime_tail_actual_steps_force_known_schedule_tail_real() -> None:
