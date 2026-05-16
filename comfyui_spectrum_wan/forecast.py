@@ -34,8 +34,7 @@ class ChebyshevFeatureForecaster:
     """
     Online Spectrum-style forecaster for WAN hidden features.
 
-    The default cache mode preserves the original dense coefficient path.
-    An optional exact low-VRAM mode avoids materializing the dense
+    The default exact low-VRAM mode avoids materializing the dense
     `(degree + 1, flat_feature_size)` coefficient tensor by caching only the
     small solver state and applying equivalent history weights chunk-by-chunk
     at prediction time.
@@ -48,7 +47,7 @@ class ChebyshevFeatureForecaster:
         blend_weight: float,
         history_size: int = 16,
         fit_chunk_size: int = 1_000_000,
-        forecaster_cache_mode: str = "legacy_dense_coeff",
+        forecaster_cache_mode: str = "low_vram_exact",
     ):
         self.degree = int(degree)
         self.ridge_lambda = float(ridge_lambda)

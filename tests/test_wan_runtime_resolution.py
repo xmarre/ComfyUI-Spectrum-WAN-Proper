@@ -166,6 +166,10 @@ class DummyModelForwardOrigOnly(DummyModel):
         self.model_options = None
 
 
+class DummyAmbiguousModel(DummyModel):
+    model_name = "custom_model.safetensors"
+
+
 def _cfg() -> SpectrumWanConfig:
     return SpectrumWanConfig(
         backend="auto",
@@ -452,6 +456,12 @@ def test_run_spectrum_forward_new_api_preserves_multitoken_timestep_shape() -> N
         def observe_feature(self, transformer_options, step_idx, feature, global_step=None):
             pass
 
+        def finalize_step(self, transformer_options, decision, *, actual_taken, forecast_taken):
+            pass
+
+        def end_step(self, transformer_options, step_idx):
+            pass
+
     inner = NewApiInner()
     block = CaptureBlock()
     inner.blocks = [block]
@@ -585,10 +595,9 @@ def test_patcher__forward_passthrough_preserves_current_transformer_runtime() ->
     assert inner.seen_transformer_options[_RUNTIME_KEY] is stale_runtime
 
 
-def test_patcher__forward_passthrough_injects_bound_runtime_when_missing() -> None:
+def test_patcher__forward_passthrough_does_not_inject_bound_runtime_when_missing() -> None:
     patched = WanSpectrumPatcher.patch(DummyModelWithForward(), _cfg())
     inner = patched.model.diffusion_model
-    current_runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
 
     transformer_options = {"cond_or_uncond": [0, 1]}
 
@@ -600,10 +609,183 @@ def test_patcher__forward_passthrough_injects_bound_runtime_when_missing() -> No
     )
 
     assert inner.seen_transformer_options is transformer_options
-    assert inner.seen_transformer_options[_RUNTIME_KEY] is current_runtime
+    assert _RUNTIME_KEY not in inner.seen_transformer_options
 
 
-def test_runtime_accumulates_history_when_sample_sigmas_are_missing() -> None:
+def test_auto_backend_resolution_warns_for_ambiguous_metadata() -> None:
+    patched = WanSpectrumPatcher.patch(DummyAmbiguousModel(), _cfg())
+    runtime = patched.model_options["transformer_options"][_RUNTIME_KEY]
+
+    assert runtime.last_info["backend_resolution_warning"] == (
+        "Spectrum WAN auto backend resolved to wan21 from ambiguous metadata. "
+        "Set backend explicitly if using Wan 2.2."
+    )
+
+
+def test_runtime_reconciles_forecast_decision_actual_fallback_accounting() -> None:
+    cfg = SpectrumWanConfig(
+        backend="wan21",
+        warmup_steps=0,
+        window_size=2.0,
+        flex_window=0.75,
+        history_size=8,
+        tail_actual_steps=1,
+    ).validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
+    sample_sigmas = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.0], dtype=torch.float32)
+    transformer_options = {
+        "sample_sigmas": sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
+
+    first = runtime.begin_step(transformer_options, sample_sigmas[0:1])
+    runtime.observe_feature(transformer_options, first["step_idx"], torch.ones((1, 2), dtype=torch.float32))
+    runtime.finalize_step(transformer_options, first, actual_taken=True, forecast_taken=False)
+    runtime.end_step(transformer_options, first["step_idx"])
+
+    second = runtime.begin_step(transformer_options, sample_sigmas[1:2])
+    runtime.observe_feature(transformer_options, second["step_idx"], torch.full((1, 2), 2.0, dtype=torch.float32))
+    runtime.finalize_step(transformer_options, second, actual_taken=True, forecast_taken=False)
+    runtime.end_step(transformer_options, second["step_idx"])
+
+    forecast_decision = runtime.begin_step(transformer_options, sample_sigmas[2:3])
+    stream = runtime._stream(transformer_options)
+    curr_ws_before_fallback = stream.curr_ws
+
+    assert forecast_decision["actual_forward"] is False
+
+    runtime.observe_feature(
+        transformer_options,
+        forecast_decision["step_idx"],
+        torch.full((1, 2), 3.0, dtype=torch.float32),
+    )
+    runtime.finalize_step(transformer_options, forecast_decision, actual_taken=True, forecast_taken=False)
+
+    assert forecast_decision["actual_forward"] is True
+    assert forecast_decision["actual_fallback"] is True
+    assert stream.forecasted_passes == 0
+    assert stream.actual_forward_count == 3
+    assert stream.num_consecutive_cached_steps == 0
+    assert stream.curr_ws == curr_ws_before_fallback
+
+
+def test_runtime_observe_feature_skips_duplicate_completed_step() -> None:
+    cfg = SpectrumWanConfig(backend="wan21").validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
+    transformer_options = {
+        "sample_sigmas": torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32),
+        "cond_or_uncond": [0, 1],
+    }
+    decision = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
+
+    runtime.observe_feature(transformer_options, decision["step_idx"], torch.ones((1, 2), dtype=torch.float32))
+    runtime.observe_feature(transformer_options, decision["step_idx"], torch.full((1, 2), 2.0, dtype=torch.float32))
+
+    stream = runtime._stream(transformer_options)
+    assert stream.forecaster is not None
+    assert len(stream.forecaster.history) == 1
+    assert torch.equal(stream.forecaster.history[0][1], torch.ones((1, 2), dtype=torch.float32))
+
+
+def test_runtime_observe_feature_ignores_unknown_schedule_before_dedupe() -> None:
+    cfg = SpectrumWanConfig(backend="wan21").validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
+    transformer_options = {"cond_or_uncond": [0, 1]}
+
+    unknown = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
+    runtime.observe_feature(transformer_options, unknown["step_idx"], torch.ones((1, 2), dtype=torch.float32))
+
+    stream = runtime._stream(transformer_options)
+    assert stream.forecaster is not None
+    assert stream.forecaster.history == []
+    assert stream.observed_step_keys == set()
+
+    scheduled_options = {
+        "sample_sigmas": torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32),
+        "cond_or_uncond": [0, 1],
+    }
+    runtime.begin_step(scheduled_options, torch.tensor([1.0], dtype=torch.float32))
+    runtime.observe_feature(scheduled_options, 0, torch.full((1, 2), 2.0, dtype=torch.float32))
+
+    scheduled_stream = runtime._stream(scheduled_options)
+    assert scheduled_stream.forecaster is not None
+    assert len(scheduled_stream.forecaster.history) == 1
+    assert torch.equal(scheduled_stream.forecaster.history[0][1], torch.full((1, 2), 2.0, dtype=torch.float32))
+
+
+def test_runtime_unknown_schedule_forecast_finalization_does_not_publish_or_count() -> None:
+    cfg = SpectrumWanConfig(
+        backend="wan22_high_noise",
+        transition_mode="bias_shift",
+    ).validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan22_high_noise", DummyModel()))
+    transformer_options = {"cond_or_uncond": [0, 1]}
+    decision = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
+    stream = runtime._stream(transformer_options)
+
+    decision["actual_forward_requested"] = False
+    decision["actual_forward"] = False
+    runtime.finalize_step(transformer_options, decision, actual_taken=False, forecast_taken=True)
+
+    assert decision["outcome_finalized"] is True
+    assert decision["forecast_taken"] is True
+    assert stream.forecasted_passes == 0
+    assert stream.num_consecutive_cached_steps == 0
+    assert stream.actual_forward_count == 0
+    assert stream.actual_history == []
+
+
+def test_runtime_warns_when_known_schedule_has_no_forecasted_steps() -> None:
+    cfg = SpectrumWanConfig(
+        backend="wan21",
+        warmup_steps=2,
+        tail_actual_steps=0,
+        debug=True,
+    ).validated()
+    runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32)
+    transformer_options = {
+        "sample_sigmas": sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
+
+    for step in range(sample_sigmas.numel() - 1):
+        decision = runtime.begin_step(transformer_options, sample_sigmas[step : step + 1])
+        runtime.observe_feature(
+            transformer_options,
+            decision["step_idx"],
+            torch.full((1, 2), float(step + 1), dtype=torch.float32),
+        )
+        runtime.finalize_step(transformer_options, decision, actual_taken=True, forecast_taken=False)
+        runtime.end_step(transformer_options, decision["step_idx"])
+
+    assert runtime.last_info["no_forecast_warning"] == (
+        "Spectrum WAN: no forecasted steps occurred. "
+        "warmup_steps/tail_actual_steps/window_size prevented acceleration."
+    )
+
+    next_sample_sigmas = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.0], dtype=torch.float32)
+    next_options = {
+        "sample_sigmas": next_sample_sigmas,
+        "cond_or_uncond": [0, 1],
+    }
+    for step in range(next_sample_sigmas.numel() - 1):
+        decision = runtime.begin_step(next_options, next_sample_sigmas[step : step + 1])
+        if decision["actual_forward"]:
+            runtime.observe_feature(
+                next_options,
+                decision["step_idx"],
+                torch.full((1, 2), float(step + 1), dtype=torch.float32),
+            )
+            runtime.finalize_step(next_options, decision, actual_taken=True, forecast_taken=False)
+        else:
+            runtime.finalize_step(next_options, decision, actual_taken=False, forecast_taken=True)
+        runtime.end_step(next_options, decision["step_idx"])
+
+    assert "no_forecast_warning" not in runtime.last_info
+
+
+def test_runtime_disables_forecast_when_sample_sigmas_are_missing() -> None:
     cfg = SpectrumWanConfig(
         backend="wan21",
         warmup_steps=0,
@@ -612,22 +794,33 @@ def test_runtime_accumulates_history_when_sample_sigmas_are_missing() -> None:
     ).validated()
     runtime = SpectrumWanRuntime(cfg, resolve_handler("wan21", DummyModel()))
     transformer_options = {"cond_or_uncond": [0, 1]}
+    stream = runtime._stream(transformer_options)
+    initial_curr_ws = stream.curr_ws
 
     first = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
     assert first["step_idx"] == 0
     assert first["actual_forward"] is True
     runtime.observe_feature(transformer_options, first["step_idx"], torch.ones((1, 2), dtype=torch.float32))
+    runtime.finalize_step(transformer_options, first, actual_taken=True, forecast_taken=False)
     runtime.end_step(transformer_options, first["step_idx"])
 
     second = runtime.begin_step(transformer_options, torch.tensor([0.8], dtype=torch.float32))
     assert second["step_idx"] == 1
     assert second["actual_forward"] is True
     runtime.observe_feature(transformer_options, second["step_idx"], torch.full((1, 2), 2.0, dtype=torch.float32))
+    runtime.finalize_step(transformer_options, second, actual_taken=True, forecast_taken=False)
     runtime.end_step(transformer_options, second["step_idx"])
 
     third = runtime.begin_step(transformer_options, torch.tensor([0.6], dtype=torch.float32))
     assert third["step_idx"] == 2
-    assert third["actual_forward"] is False
+    assert third["actual_forward"] is True
+    assert third["schedule_known"] is False
+    assert stream.curr_ws == initial_curr_ws
+    assert stream.actual_forward_count == 0
+    assert stream.forecasted_passes == 0
+    assert stream.num_consecutive_cached_steps == 0
+    assert stream.forecaster is not None
+    assert stream.forecaster.history == []
 
 
 def test_runtime_tail_actual_steps_force_known_schedule_tail_real() -> None:
@@ -656,12 +849,15 @@ def test_runtime_tail_actual_steps_force_known_schedule_tail_real() -> None:
                 decision["step_idx"],
                 torch.full((1, 2), float(step + 1), dtype=torch.float32),
             )
+            runtime.finalize_step(transformer_options, decision, actual_taken=True, forecast_taken=False)
+        else:
+            runtime.finalize_step(transformer_options, decision, actual_taken=False, forecast_taken=True)
         runtime.end_step(transformer_options, decision["step_idx"])
 
     assert [d["actual_forward"] for d in decisions] == [True, True, False, True, True]
 
 
-def test_runtime_tail_actual_steps_ignored_without_known_schedule_length() -> None:
+def test_runtime_forecast_disabled_without_known_schedule_length() -> None:
     cfg = SpectrumWanConfig(
         backend="wan21",
         warmup_steps=0,
@@ -675,14 +871,17 @@ def test_runtime_tail_actual_steps_ignored_without_known_schedule_length() -> No
 
     first = runtime.begin_step(transformer_options, torch.tensor([1.0], dtype=torch.float32))
     runtime.observe_feature(transformer_options, first["step_idx"], torch.ones((1, 2), dtype=torch.float32))
+    runtime.finalize_step(transformer_options, first, actual_taken=True, forecast_taken=False)
     runtime.end_step(transformer_options, first["step_idx"])
 
     second = runtime.begin_step(transformer_options, torch.tensor([0.8], dtype=torch.float32))
     runtime.observe_feature(transformer_options, second["step_idx"], torch.full((1, 2), 2.0, dtype=torch.float32))
+    runtime.finalize_step(transformer_options, second, actual_taken=True, forecast_taken=False)
     runtime.end_step(transformer_options, second["step_idx"])
 
     third = runtime.begin_step(transformer_options, torch.tensor([0.6], dtype=torch.float32))
-    assert third["actual_forward"] is False
+    assert third["actual_forward"] is True
+    assert third["schedule_known"] is False
 
 
 def test_runtime_missing_sample_sigmas_does_not_reuse_previous_schedule_length() -> None:
@@ -704,6 +903,7 @@ def test_runtime_missing_sample_sigmas_does_not_reuse_previous_schedule_length()
         first_scheduled["step_idx"],
         torch.ones((1, 2), dtype=torch.float32),
     )
+    runtime.finalize_step(scheduled_options, first_scheduled, actual_taken=True, forecast_taken=False)
     runtime.end_step(scheduled_options, first_scheduled["step_idx"])
     second_scheduled = runtime.begin_step(scheduled_options, torch.tensor([0.5], dtype=torch.float32))
     runtime.observe_feature(
@@ -711,6 +911,7 @@ def test_runtime_missing_sample_sigmas_does_not_reuse_previous_schedule_length()
         second_scheduled["step_idx"],
         torch.full((1, 2), 2.0, dtype=torch.float32),
     )
+    runtime.finalize_step(scheduled_options, second_scheduled, actual_taken=True, forecast_taken=False)
     runtime.end_step(scheduled_options, second_scheduled["step_idx"])
     assert runtime.num_steps() == 2
 
@@ -721,16 +922,19 @@ def test_runtime_missing_sample_sigmas_does_not_reuse_previous_schedule_length()
     assert "spectrum_wan_active_num_steps" not in unscheduled_options
     assert runtime.last_info["num_steps"] == 0
     runtime.observe_feature(unscheduled_options, first["step_idx"], torch.ones((1, 2), dtype=torch.float32))
+    runtime.finalize_step(unscheduled_options, first, actual_taken=True, forecast_taken=False)
     runtime.end_step(unscheduled_options, first["step_idx"])
 
     second = runtime.begin_step(unscheduled_options, torch.tensor([0.8], dtype=torch.float32))
     assert second["step_idx"] == 1
     runtime.observe_feature(unscheduled_options, second["step_idx"], torch.full((1, 2), 2.0, dtype=torch.float32))
+    runtime.finalize_step(unscheduled_options, second, actual_taken=True, forecast_taken=False)
     runtime.end_step(unscheduled_options, second["step_idx"])
 
     third = runtime.begin_step(unscheduled_options, torch.tensor([0.6], dtype=torch.float32))
     assert third["step_idx"] == 2
-    assert third["actual_forward"] is False
+    assert third["actual_forward"] is True
+    assert third["schedule_known"] is False
 
 
 def test_runtime_reuses_completed_final_sigma_decision_before_next_cycle_reset() -> None:
@@ -757,6 +961,9 @@ def test_runtime_reuses_completed_final_sigma_decision_before_next_cycle_reset()
                 decision["step_idx"],
                 torch.full((1, 2), float(step + 1), dtype=torch.float32),
             )
+            runtime.finalize_step(transformer_options, decision, actual_taken=True, forecast_taken=False)
+        else:
+            runtime.finalize_step(transformer_options, decision, actual_taken=False, forecast_taken=True)
         runtime.end_step(transformer_options, decision["step_idx"])
 
     final_duplicate = runtime.begin_step(
@@ -896,6 +1103,13 @@ def test_run_spectrum_forward_records_forecast_errors_and_falls_back(capsys) -> 
         def observe_feature(self, transformer_options, step_idx, feature, global_step=None):
             self.observed.append((step_idx, global_step, tuple(feature.shape)))
 
+        def finalize_step(self, transformer_options, decision, *, actual_taken, forecast_taken):
+            decision["actual_taken"] = actual_taken
+            decision["forecast_taken"] = forecast_taken
+
+        def end_step(self, transformer_options, step_idx):
+            pass
+
     runtime = RuntimeStub()
     out = _run_spectrum_forward(
         inner,
@@ -932,6 +1146,13 @@ def test_run_spectrum_forward_clears_stale_forecast_error_before_non_forecast_st
 
         def observe_feature(self, transformer_options, step_idx, feature, global_step=None):
             self.observed.append((step_idx, global_step, tuple(feature.shape)))
+
+        def finalize_step(self, transformer_options, decision, *, actual_taken, forecast_taken):
+            decision["actual_taken"] = actual_taken
+            decision["forecast_taken"] = forecast_taken
+
+        def end_step(self, transformer_options, step_idx):
+            pass
 
     runtime = RuntimeStub()
     out = _run_spectrum_forward(

@@ -84,8 +84,8 @@ No additional dependencies are required beyond normal ComfyUI requirements.
 - `history_size` — number of actual WAN features to retain for fitting
 - `tail_actual_steps` — number of final known-schedule solver steps forced to stay on the actual WAN path
 - `forecaster_cache_mode` — Chebyshev cache implementation mode
-  - `legacy_dense_coeff` — default; preserves the original dense coefficient cache path
-  - `low_vram_exact` — opt-in exact low-VRAM mode; avoids the dense coefficient cache and applies equivalent history weights chunk-by-chunk at prediction time
+  - `low_vram_exact` — default; avoids the dense coefficient cache and applies equivalent history weights chunk-by-chunk at prediction time
+  - `legacy_dense_coeff` — opt-in fast path for systems with abundant VRAM; preserves the original dense coefficient cache path
 - `debug` — emit runtime step decisions to stderr
 
 **Output**
@@ -94,7 +94,7 @@ No additional dependencies are required beyond normal ComfyUI requirements.
 
 ## Recommended defaults
 
-These defaults match the official Spectrum WAN setup closely enough for native ComfyUI usage:
+These defaults keep the reference-style cadence conservative while reducing WAN feature-cache VRAM pressure:
 
 ```text
 blend_weight = 1.0
@@ -106,7 +106,7 @@ warmup_steps = 5
 history_size = 16
 tail_actual_steps = 1
 transition_mode = separate_fit
-forecaster_cache_mode = legacy_dense_coeff
+forecaster_cache_mode = low_vram_exact
 ```
 
 ### Why `history_size = 16` instead of 100?
@@ -119,14 +119,14 @@ That is an explicit practical approximation in this repo.
 
 `tail_actual_steps` reserves the final known-schedule solver steps for real WAN forwards instead of forecasted features. This mirrors the FLUX Spectrum node's tail guard and protects the refinement tail, where forecast bias is most likely to appear as softened microdetail or late-step texture drift.
 
-The guard is only applied when ComfyUI exposes a known schedule length through `sample_sigmas`. When a sampler path does not expose that length, WAN keeps the previous moving lower-bound behavior and does not treat the current lower-bound estimate as the real final tail.
+The guard is only applied when ComfyUI exposes a known schedule length through `sample_sigmas`. When a sampler path does not expose that length, WAN disables forecast decisions and keeps actual forwards only, because hidden feature history cannot be safely bounded across unrelated runs without a real schedule boundary.
 
 ### Forecaster cache modes
 
 `Spectrum Apply WAN` exposes two Chebyshev cache modes:
 
-- `legacy_dense_coeff` preserves the original implementation behavior and remains the default.
-- `low_vram_exact` is an opt-in exact mode that avoids materializing the dense `(degree + 1, flat_feature_size)` coefficient cache on the feature device.
+- `low_vram_exact` avoids materializing the dense `(degree + 1, flat_feature_size)` coefficient cache on the feature device and is the default.
+- `legacy_dense_coeff` preserves the original implementation behavior and remains available as an explicit fast option when VRAM is abundant.
 
 `low_vram_exact` keeps the same ridge/Chebyshev forecast formulation and is intended for workloads where the dense coefficient cache causes unnecessary VRAM pressure. It should preserve expected output quality, but it is not guaranteed to be bit-identical to `legacy_dense_coeff` because the two paths quantize intermediate values at different points.
 
@@ -212,9 +212,9 @@ It also separates stream state by `cond_or_uncond` signature when ComfyUI provid
 
 WAN hidden features are very large. To keep the implementation practical, the ridge solve is implemented in **feature-dimension chunks**, which avoids the worst transient float32 allocations from a naive `(K, F)` full-matrix solve.
 
-In the default `legacy_dense_coeff` mode, the final dense coefficient tensor is still cached on the feature device to preserve the original fast prediction path.
+The default `low_vram_exact` mode avoids caching the final dense coefficient tensor on the feature device.
 
-The optional `low_vram_exact` mode keeps the same ridge/Chebyshev formulation but avoids caching that dense coefficient tensor. Instead, it stores only the small solver state and applies the equivalent history weights chunk-by-chunk at prediction time. That materially reduces avoidable VRAM overhead while keeping the same forecasting mechanism.
+The optional `legacy_dense_coeff` mode preserves the original dense-cache fast prediction path for systems with abundant VRAM. `low_vram_exact` keeps the same ridge/Chebyshev formulation, stores only the small solver state, and applies the equivalent history weights chunk-by-chunk at prediction time. That materially reduces avoidable VRAM overhead while keeping the same forecasting mechanism.
 
 ## Assumptions, caveats, and limitations
 

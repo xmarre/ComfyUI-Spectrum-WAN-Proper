@@ -46,7 +46,7 @@ class SpectrumWanConfig:
     tail_actual_steps: int = 1
     fit_chunk_size: int = 1_000_000
     debug: bool = False
-    forecaster_cache_mode: str = "legacy_dense_coeff"
+    forecaster_cache_mode: str = "low_vram_exact"
 
     def validated(self) -> "SpectrumWanConfig":
         if self.backend not in _VALID_BACKENDS:
