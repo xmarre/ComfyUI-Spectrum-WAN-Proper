@@ -38,10 +38,10 @@ class SpectrumApplyWAN:
                 "debug": ("BOOLEAN", {"default": False}),
                 "forecaster_cache_mode": (
                     [
-                        "legacy_dense_coeff",
                         "low_vram_exact",
+                        "legacy_dense_coeff",
                     ],
-                    {"default": "legacy_dense_coeff"},
+                    {"default": "low_vram_exact"},
                 ),
                 "tail_actual_steps": ("INT", {"default": 1, "min": 0, "max": 64, "step": 1}),
             }

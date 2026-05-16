@@ -163,6 +163,7 @@ class _StreamState:
     bias_shift_global_anchor: Optional[int] = None
     bias_shift_global_anchor_step_idx: int = 0
     global_step_override_anchor_step_idx: int = 0
+    observed_step_keys: Set[Tuple[int, int]] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.curr_ws = float(self.cfg.window_size)
@@ -193,6 +194,7 @@ class _StreamState:
         self.bias_shift_global_anchor = None
         self.bias_shift_global_anchor_step_idx = 0
         self.global_step_override_anchor_step_idx = 0
+        self.observed_step_keys.clear()
         assert self.forecaster is not None
         self.forecaster.reset()
 
@@ -310,17 +312,20 @@ class SpectrumWanRuntime:
             self.last_info["schedule_signature_source"] = "missing"
             self.last_info.pop("schedule_signature_len", None)
             self.last_info.pop("schedule_signature_error", None)
+            transformer_options["spectrum_wan_schedule_known"] = False
             return None
         try:
             vals = sample_sigmas.detach().float().cpu().flatten().tolist()
             self.last_info["schedule_signature_source"] = "sample_sigmas"
             self.last_info["schedule_signature_len"] = len(vals)
             self.last_info.pop("schedule_signature_error", None)
+            transformer_options["spectrum_wan_schedule_known"] = True
             return tuple(round(float(v), 8) for v in vals)
         except Exception as exc:
             self.last_info["schedule_signature_source"] = "error"
             self.last_info.pop("schedule_signature_len", None)
             self.last_info["schedule_signature_error"] = f"{type(exc).__name__}: {exc}"
+            transformer_options["spectrum_wan_schedule_known"] = False
             self._debug_log(f"[Spectrum WAN] schedule_signature_error={type(exc).__name__}: {exc}")
             return None
 
@@ -429,6 +434,13 @@ class SpectrumWanRuntime:
         if not already_finished and self._should_publish_bias_shift_handoff() and stream.run_token is not None:
             handoff_key = (int(stream.run_token), key[1], _HIGH_TO_LOW_DIRECTION)
             self._orphaned_handoff_keys.add(handoff_key)
+        if not already_finished and self.cfg.debug and stream.forecasted_passes <= 0:
+            message = (
+                "Spectrum WAN: no forecasted steps occurred. "
+                "warmup_steps/tail_actual_steps/window_size prevented acceleration."
+            )
+            self.last_info["no_forecast_warning"] = message
+            self._debug_log(f"[Spectrum WAN] {message}")
 
         # Do not immediately reset/pop the stream here. WAN 2.1 can perform a
         # duplicate model call at the completed final sigma. If we clear state
@@ -599,8 +611,11 @@ class SpectrumWanRuntime:
         transformer_options[_GLOBAL_STEP_KEY] = int(global_step)
 
         tail_actual_only = self._is_tail_actual_step(step_idx, known_num_steps)
+        schedule_unknown = known_num_steps is None
 
-        if not tail_actual_only and step_idx >= self.cfg.warmup_steps:
+        if schedule_unknown:
+            actual_forward = True
+        elif not tail_actual_only and step_idx >= self.cfg.warmup_steps:
             actual_forward = (
                 (stream.num_consecutive_cached_steps + 1)
                 % max(1, math.floor(stream.curr_ws))
@@ -616,23 +631,17 @@ class SpectrumWanRuntime:
             if not stream.forecaster.ready():
                 actual_forward = True
 
-        if actual_forward:
-            if step_idx >= self.cfg.warmup_steps:
-                stream.curr_ws = round(stream.curr_ws + float(self.cfg.flex_window), 3)
-            stream.num_consecutive_cached_steps = 0
-            stream.actual_forward_count += 1
-        else:
-            stream.num_consecutive_cached_steps += 1
-            stream.forecasted_passes += 1
-
         decision = {
             "sigma": sigma,
             "step_idx": step_idx,
             "global_step": global_step,
             "actual_forward": actual_forward,
+            "actual_forward_requested": actual_forward,
             "run_id": self.run_id,
             "phase_tag": self.handler.phase_tag,
             "stream_key": self._stream_key(transformer_options),
+            "schedule_known": known_num_steps is not None,
+            "outcome_finalized": False,
         }
         forecast_ready = has_ready_transfer or (
             stream.bias_shift_predictor is None
@@ -650,12 +659,46 @@ class SpectrumWanRuntime:
             f"sigma={sigma:.8f} "
             f"actual_forward={actual_forward} "
             f"curr_ws={stream.curr_ws:.3f} "
+            f"schedule_known={known_num_steps is not None} "
             f"forecast_ready={forecast_ready}"
         )
         stream.decisions_by_sigma[sigma] = decision
-        if self._should_publish_bias_shift_handoff() and not actual_forward:
-            self._publish_bias_shift_handoff(transformer_options, stream)
         return decision
+
+    def finalize_step(
+        self,
+        transformer_options: Dict[str, Any],
+        decision: Dict[str, Any],
+        *,
+        actual_taken: bool,
+        forecast_taken: bool,
+    ) -> None:
+        if decision.get("outcome_finalized"):
+            return
+        if bool(actual_taken) == bool(forecast_taken):
+            raise ValueError("Exactly one of actual_taken or forecast_taken must be true.")
+
+        stream = self._stream(transformer_options)
+        step_idx = int(decision["step_idx"])
+        requested_actual = bool(decision.get("actual_forward_requested", decision.get("actual_forward", True)))
+        if actual_taken:
+            if requested_actual and step_idx >= self.cfg.warmup_steps:
+                stream.curr_ws = round(stream.curr_ws + float(self.cfg.flex_window), 3)
+            stream.num_consecutive_cached_steps = 0
+            stream.actual_forward_count += 1
+            decision["actual_forward"] = True
+            if not requested_actual:
+                decision["actual_fallback"] = True
+        else:
+            stream.num_consecutive_cached_steps += 1
+            stream.forecasted_passes += 1
+            decision["actual_forward"] = False
+            if self._should_publish_bias_shift_handoff():
+                self._publish_bias_shift_handoff(transformer_options, stream)
+
+        decision["forecast_taken"] = bool(forecast_taken)
+        decision["actual_taken"] = bool(actual_taken)
+        decision["outcome_finalized"] = True
 
     def observe_feature(
         self,
@@ -665,6 +708,10 @@ class SpectrumWanRuntime:
         global_step: Optional[int] = None,
     ) -> None:
         stream = self._stream(transformer_options)
+        observed_key = (int(self.run_id), int(step_idx))
+        if observed_key in stream.observed_step_keys:
+            return
+        stream.observed_step_keys.add(observed_key)
         assert stream.forecaster is not None
         stream.forecaster.update(step_idx, feature)
         feature_ref = feature.detach()

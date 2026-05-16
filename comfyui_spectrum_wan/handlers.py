@@ -58,6 +58,29 @@ def resolve_handler(backend: str, model: Any) -> WanBackendHandler:
     return _HANDLERS["wan21"]
 
 
+def auto_backend_warning(backend: str, model: Any, handler: WanBackendHandler) -> Optional[str]:
+    if backend != "auto":
+        return None
+
+    joined = " | ".join(_candidate_strings(model))
+    if not joined:
+        return (
+            f"Spectrum WAN auto backend resolved to {handler.backend_id} without model metadata. "
+            "Set backend explicitly if using Wan 2.2."
+        )
+    if handler.backend_id == "wan21":
+        return (
+            "Spectrum WAN auto backend resolved to wan21 from ambiguous metadata. "
+            "Set backend explicitly if using Wan 2.2."
+        )
+    if handler.backend_id == "wan22_ti2v_5b" and "high_noise" not in joined and "low_noise" not in joined:
+        return (
+            "Spectrum WAN auto backend resolved to wan22_ti2v_5b without high/low expert metadata. "
+            "Set backend explicitly for Wan 2.2 14B expert workflows."
+        )
+    return None
+
+
 def handler_metadata(handler: WanBackendHandler) -> Dict[str, object]:
     return {
         "backend_id": handler.backend_id,

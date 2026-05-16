@@ -23,7 +23,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - ComfyUI is not availabl
         raise
 
 from .config import SpectrumWanConfig
-from .handlers import resolve_handler
+from .handlers import auto_backend_warning, resolve_handler
 from .runtime import SpectrumWanRuntime
 
 _RUNTIME_KEY = "spectrum_wan_runtime"
@@ -750,22 +750,30 @@ def _run_spectrum_forward_via_original(
             predicted_x = None
 
         if predicted_x is not None:
-            grid_sizes, head_emb, full_ref_len, _context_img_len = _prepare_wan_forecast_output_state(
-                inner,
-                x,
-                t,
-                context,
-                clip_fea=clip_fea,
-                **kwargs,
-            )
-            predicted_x = predicted_x.to(device=head_emb.device, dtype=head_emb.dtype)
-            if torch.isfinite(predicted_x).all():
+            try:
+                grid_sizes, head_emb, full_ref_len, _context_img_len = _prepare_wan_forecast_output_state(
+                    inner,
+                    x,
+                    t,
+                    context,
+                    clip_fea=clip_fea,
+                    **kwargs,
+                )
+                predicted_x = predicted_x.to(device=head_emb.device, dtype=head_emb.dtype)
                 out_tokens = inner.head(predicted_x, head_emb)
                 if full_ref_len:
                     out_tokens = out_tokens[:, full_ref_len:]
                 out = inner.unpatchify(out_tokens, grid_sizes)
+                runtime.finalize_step(transformer_options, decision, actual_taken=False, forecast_taken=True)
                 runtime.end_step(transformer_options, step_idx)
                 return out
+            except Exception as exc:
+                runtime.last_info["forecast_error"] = f"{type(exc).__name__}: {exc}"
+                runtime._debug_log(
+                    "[Spectrum WAN] forecast reconstruction fallback "
+                    f"step={step_idx} global_step={decision.get('global_step')} "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     out = _call_original_forward_with_feature_capture(
         inner,
@@ -781,6 +789,7 @@ def _run_spectrum_forward_via_original(
         global_step=decision.get("global_step"),
         **kwargs,
     )
+    runtime.finalize_step(transformer_options, decision, actual_taken=True, forecast_taken=False)
     runtime.end_step(transformer_options, step_idx)
     return out
 
@@ -878,15 +887,30 @@ def _run_spectrum_forward(
             predicted_x = None
 
         if predicted_x is not None:
-            predicted_x = predicted_x.to(device=x.device, dtype=x.dtype)
-            if torch.isfinite(predicted_x).all():
-                x = predicted_x
-                x = inner.head(x, head_emb)
-                if full_ref is not None:
-                    x = x[:, full_ref.shape[1]:]
-                out = inner.unpatchify(x, grid_sizes)
-                runtime.end_step(transformer_options, step_idx)
-                return out
+            try:
+                predicted_x = predicted_x.to(device=x.device, dtype=x.dtype)
+                if predicted_x.shape != x.shape:
+                    runtime.last_info["forecast_error"] = (
+                        f"predicted feature shape {tuple(predicted_x.shape)} "
+                        f"does not match expected {tuple(x.shape)}"
+                    )
+                    predicted_x = None
+                else:
+                    x = predicted_x
+                    x = inner.head(x, head_emb)
+                    if full_ref is not None:
+                        x = x[:, full_ref.shape[1]:]
+                    out = inner.unpatchify(x, grid_sizes)
+                    runtime.finalize_step(transformer_options, decision, actual_taken=False, forecast_taken=True)
+                    runtime.end_step(transformer_options, step_idx)
+                    return out
+            except Exception as exc:
+                runtime.last_info["forecast_error"] = f"{type(exc).__name__}: {exc}"
+                runtime._debug_log(
+                    "[Spectrum WAN] forecast reconstruction fallback "
+                    f"step={step_idx} global_step={decision.get('global_step')} "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -929,6 +953,7 @@ def _run_spectrum_forward(
         x,
         global_step=decision.get("global_step"),
     )
+    runtime.finalize_step(transformer_options, decision, actual_taken=True, forecast_taken=False)
 
     x = inner.head(x, head_emb)
     if full_ref is not None:
@@ -1132,9 +1157,6 @@ def _run_apply_model_forecast_output(
         if predicted_x.shape[-1] != getattr(inner.head, "dim", predicted_x.shape[-1]):
             runtime.last_info["forecast_error"] = "predicted feature dimension does not match head"
             return None
-        if not torch.isfinite(predicted_x).all():
-            runtime.last_info["forecast_error"] = "predicted feature contains non-finite values"
-            return None
 
         out_tokens = inner.head(predicted_x, head_emb)
         if full_ref_len:
@@ -1193,6 +1215,7 @@ def _run_wan21_from_apply_model_wrapper(
             **kwargs,
         )
         if forecasted is not None:
+            runtime.finalize_step(transformer_options, decision, actual_taken=False, forecast_taken=True)
             runtime.end_step(transformer_options, step_idx)
             return forecasted
 
@@ -1214,6 +1237,7 @@ def _run_wan21_from_apply_model_wrapper(
         runtime.last_info["apply_driver_error"] = f"{type(exc).__name__}: {exc}"
         runtime.reset_all()
         raise
+    runtime.finalize_step(transformer_options, decision, actual_taken=True, forecast_taken=False)
     runtime.end_step(transformer_options, step_idx)
     return out
 
@@ -1328,11 +1352,6 @@ def _spectrum_wan_diffusion_model_wrapper(
 
     inner = getattr(executor, "class_obj", None)
     runtime = _resolve_runtime(transformer_options)
-    if runtime is None and inner is not None:
-        bound_runtime = getattr(inner, "_spectrum_wan_runtime", None)
-        if isinstance(bound_runtime, SpectrumWanRuntime):
-            runtime = bound_runtime
-            transformer_options[_RUNTIME_KEY] = runtime
 
     if runtime is None or not runtime.cfg.enabled or inner is None:
         return executor(
@@ -1456,10 +1475,6 @@ def _wrap_wan__forward_passthrough(inner: Any) -> None:
     ):
         if transformer_options is None:
             transformer_options = {}
-        if isinstance(transformer_options, dict) and _RUNTIME_KEY not in transformer_options:
-            current_runtime = getattr(inner, "_spectrum_wan_runtime", None)
-            if isinstance(current_runtime, SpectrumWanRuntime):
-                transformer_options[_RUNTIME_KEY] = current_runtime
         return original__forward(
             x,
             timestep,
@@ -1488,6 +1503,12 @@ class WanSpectrumPatcher:
             runtime.update(cfg, handler)
         else:
             runtime = SpectrumWanRuntime(cfg, handler)
+        warning = auto_backend_warning(cfg.backend, patched, handler)
+        if warning is not None:
+            runtime.last_info["backend_resolution_warning"] = warning
+            runtime._debug_log(f"[Spectrum WAN] {warning}")
+        else:
+            runtime.last_info.pop("backend_resolution_warning", None)
 
         tr_opts[_CFG_KEY] = cfg
         tr_opts[_RUNTIME_KEY] = runtime
